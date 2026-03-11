@@ -25,7 +25,7 @@ from app.agents.tools import (
     process_thinking_tool,
 )
 from app.data_structures import MessageThread
-from app.log import print_ace, print_solve
+from app.log import print_ace, print_solve, set_active_agent
 from app.model import common
 from app.model.common import (
     Usage,
@@ -106,6 +106,8 @@ def solve(
         - usage_details: usage details for each tool
         - msg_thread: message thread for debugging
     """
+    set_active_agent("solver")
+
     msg_thread = MessageThread()
     system_prompt = unescape(Instructions(instructions=SYSTEM_PROMPT).to_xml().decode())
     msg_thread.add_system(system_prompt)
@@ -129,7 +131,7 @@ def solve(
 
     print_ace(
         user_prompt_execution_info + "\n\n" + user_prompt_target_path_constraint,
-        "Path Constraint Solving",
+        "Constraints for Target Branch (Input for Solving Agent)",
     )
 
     solution_found = False
@@ -229,14 +231,10 @@ def solve(
         update_usage_details(usage_details, last_call, get_usage_output_part(usage))
 
     logger.debug("Solve process message thread: {}", msg_thread)
-    print_solve(
-        f"SATISFIABLE: {is_satisfiable}\n\n"
-        + (
-            f"PYTHON EXECUTION: ```python\n{python_execution}\n```\n\n"
-            if is_satisfiable
-            else ""
-        ),
-        "Target Path Constraint Solving Result",
+    logger.debug(
+        "Solve result: is_satisfiable={}, python_execution={}",
+        is_satisfiable,
+        python_execution,
     )
 
     # Return the solution
@@ -258,6 +256,8 @@ def review_solve(
         msg_thread: message thread for debugging
     """
     msg_thread.add_user(REVIEW_SOLUTION_USER_PROMPT)
+
+    set_active_agent("solver")
 
     finished = False
     need_adjust = None

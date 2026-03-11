@@ -1,6 +1,8 @@
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 from loguru import logger
 
+from app.log import print_tool_call
+
 _FINISH_DESCRIPTION = """Signals the completion of the target branch selection and path constraint generation process.
 
 Use this tool when:
@@ -41,6 +43,12 @@ def process_summarize_finish(task_completed) -> tuple[str, bool, bool]:
         Tuple of (observation message, is_valid, task_completed)
     """
     logger.info(f"Finish tool called with task_completed: {task_completed}")
+    print_tool_call(
+        "Summarize Finish",
+        f"task_completed = **{task_completed}**",
+        icon="🏁",
+        func_name="finish",
+    )
 
     observation = None
     if task_completed is None:

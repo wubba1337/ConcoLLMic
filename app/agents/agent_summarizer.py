@@ -36,7 +36,7 @@ from app.agents.tools import (
     process_thinking_tool,
 )
 from app.data_structures import MessageThread
-from app.log import print_ace, print_summarize
+from app.log import print_ace, print_summarize, set_active_agent
 from app.model import common
 from app.model.common import (
     Usage,
@@ -458,6 +458,8 @@ def summarize(
         - msg_thread: current message thread
     """
 
+    set_active_agent("summarizer")
+
     msg_thread: MessageThread = MessageThread()
     system_prompt = (
         Instructions(instructions=SYSTEM_PROMPT).to_xml()
@@ -515,7 +517,7 @@ def summarize(
 
     msg_thread.add_user(user_prompt)
 
-    print_ace(user_prompt, "Target Branch Selection and Path Constraint Summarization")
+    print_ace(user_prompt, "Execution Abstraction (Input for Summarization Agent)")
 
     finished = False
 
@@ -683,16 +685,18 @@ def summarize(
                 finished = True
 
     # Create a summary of all branches explored
-    final_output = "\nEXPLORATION SUMMARY:\n"
+    final_output = "\n**EXPLORATION SUMMARY**\n\n"
     for i, branch in enumerate(state["selected_branches"]):
-        final_output += f"\n--- Branch {i+1} ---\n"
-        final_output += f"TARGET BRANCH:\n{branch['target_branch']}\n\n"
-        final_output += f"JUSTIFICATION:\n{branch['justification']}\n\n"
-        final_output += f"EXPECTED COVERED LINES:\n{branch['expected_covered_filepath']}:{branch['expected_covered_lines'][0]}-{branch['expected_covered_lines'][1]}\n\n"
-        final_output += f"PATH CONSTRAINT:\n{branch['path_constraint']}\n"
+        final_output += "---\n\n"
+        final_output += f"**Branch {i+1}**\n\n"
+        final_output += f"**TARGET BRANCH:** {branch['target_branch']}\n\n"
+        final_output += f"**JUSTIFICATION:** {branch['justification']}\n\n"
+        final_output += f"**EXPECTED COVERED LINES:** {branch['expected_covered_filepath']}:{branch['expected_covered_lines'][0]}-{branch['expected_covered_lines'][1]}\n\n"
+        final_output += f"**PATH CONSTRAINT:**\n\n{branch['path_constraint']}\n"
 
-    print_summarize(final_output, "Target Branch Selection and Path Constraint Results")
-
+    logger.debug(
+        "Target Branch Selection and Path Constraint Results:\n%s", final_output
+    )
     logger.debug(
         "Calling model for target branch selection and path constraint summarization. Completed message thread: {}",
         msg_thread,
@@ -776,6 +780,8 @@ def review_summary(
         usage_details: usage details for each tool
         msg_thread: message thread for debugging
     """
+
+    set_active_agent("summarizer")
 
     user_prompt = unescape(
         (

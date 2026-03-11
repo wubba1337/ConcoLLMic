@@ -12,6 +12,7 @@ from app.agents.common import (
     delete_instrumentation_from_code,
 )
 from app.agents.coverage import Coverage
+from app.log import print_tool_call
 from app.utils.utils import (
     detect_language,
     format_code,
@@ -121,6 +122,13 @@ def process_code_request(
     files = [(req.get("filepath"), req.get("lines", "ALL")) for req in file_requests]
     logger.info(
         f"Code request received for {num_files} file(s): {', '.join(f'{file[0]} ({file[1]})' for file in files)}"
+    )
+    files_summary = "\n".join(f"- `{fp}` (lines {lr})" for fp, lr in files)
+    print_tool_call(
+        "Code Request",
+        f"Requesting {num_files} file(s):\n\n{files_summary}",
+        icon="📂",
+        func_name="request_code",
     )
 
     # Process each file request

@@ -6,6 +6,8 @@ import z3
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 from loguru import logger
 
+from app.log import print_tool_call
+
 _SMT_SOLVER_DESCRIPTION = """Use this tool to solve SMT (Satisfiability Modulo Theories) constraints using Z3 solver.
 
 This tool supports two input formats:
@@ -89,6 +91,12 @@ def process_smt_solver(smt_constraints: str | None) -> tuple[str, bool]:
         Tuple of (result message, satisfiable && execution_succeeded)
     """
     logger.info(f"Solving SMT constraints:\n{smt_constraints}")
+    print_tool_call(
+        "SMT Solver",
+        f"```\n{smt_constraints}\n```",
+        icon="🧮",
+        func_name="solve_with_smt",
+    )
     if not smt_constraints or not smt_constraints.strip():
         logger.warning("`smt_constraints` is not provided or it is empty.")
         return (

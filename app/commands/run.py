@@ -30,6 +30,7 @@ from app.agents.states import ConcolicExecutionState, TestcaseState
 from app.agents.testcase import TestCase, TestCaseManager
 from app.agents.trace import trace_compress
 from app.data_structures import MessageThread
+from app.log import print_phase, print_step
 from app.model.common import Usage
 from app.utils.utils import (
     compress_repeating_sequences,
@@ -202,11 +203,13 @@ def solve_and_execute(
                         "TestCase #{}: Solving path constraint...",
                         tc.id,
                     )
+                    print_step(f"TestCase #{tc.id}: Solving path constraint...")
                 else:
                     logger.info(
                         "TestCase #{}: Solving constraints after reviewing summarizer...",
                         tc.id,
                     )
+                    print_step(f"TestCase #{tc.id}: Re-solving after review...")
 
                 (
                     tc.is_satisfiable,
@@ -296,6 +299,7 @@ def solve_and_execute(
                 or tc.current_state == TestcaseState.REVIEW_SUMMARY_EXECUTE
             ):
                 # Execute the test case and collect trace
+                print_step(f"TestCase #{tc.id}: Executing program...")
                 result = run_target(tc.exec_code, timeout=exec_timeout)
 
                 if not result["exec_success"]:
@@ -349,6 +353,10 @@ def solve_and_execute(
                     tc.target_file_lines,
                     tc.is_target_covered,
                     tc.newly_covered_lines,
+                )
+                covered_icon = "[green]✓[/]" if tc.is_target_covered else "[red]✗[/]"
+                print_step(
+                    f"TestCase #{tc.id}: Target covered {covered_icon}  |  New lines: {tc.newly_covered_lines}"
                 )
 
                 # Determine next state
@@ -513,6 +521,9 @@ def run_concolic_execution(
         f"{plateau_slot} minutes" if plateau_slot else "None",
         f"{rounds}" if rounds else "None",
     )
+    print_step(
+        f"Starting concolic execution: {rounds or '∞'} rounds, parallel={parallel_num}, strategy={test_selection.value}"
+    )
     update_project_dir(project_dir)
 
     # Initialize TestCaseManager
@@ -528,6 +539,7 @@ def run_concolic_execution(
 
     if initial_execution_file:
         # Initialize execution variables
+        print_step("Running initial test case...")
         exec_code = open(initial_execution_file).read()
         result = run_target(exec_code, timeout=timeout)
 
@@ -557,8 +569,9 @@ def run_concolic_execution(
             sys.exit(1)
 
         assert is_target_lines_covered
-
+        print_step(f"Initial test case: {new_covered_lines} lines covered")
         # Create initial test case
+
         testcase_manager.add_initial_testcase(
             exec_code, execution_trace, execution_summary, new_covered_lines
         )
@@ -639,6 +652,7 @@ def run_concolic_execution(
         set_concolic_execution_state(cur_ce_state)
         match cur_ce_state:
             case ConcolicExecutionState.SELECT:
+                print_phase("SELECT", round_num=round_cnt)
                 selection_usage_details = {"TOTAL": Usage()}
                 # select a test case
                 if test_selection == TestCaseSelection.LLM:
@@ -696,6 +710,7 @@ def run_concolic_execution(
                 logger.info(
                     "Using test case #{} as the base test case.", src_testcase.id
                 )
+                print_step(f"Using test case #{src_testcase.id} as the base test case")
 
                 # Refresh execution summary but DO NOT update the original execution summary of the testcase (used as backup)
                 _, _, latest_src_exec_summary = _collect_trace_and_check_coverage(
@@ -708,6 +723,7 @@ def run_concolic_execution(
                 cur_ce_state = ConcolicExecutionState.SUMMARIZE
             case ConcolicExecutionState.SUMMARIZE:
                 # summarize the test case
+                print_phase("SUMMARIZE")
                 branches_yielded_cnt = 0
 
                 func_call_chain_list = [
@@ -834,6 +850,9 @@ def run_concolic_execution(
                     logger.info(
                         f"Submitted new test case #{new_testcase.id} for solving and executing"
                     )
+                    print_step(
+                        f"Submitted test case #{new_testcase.id} → solve & execute"
+                    )
 
                 # If no branches were generated, the should be prompt exceeded the token limit
                 if branches_yielded_cnt == 0:
@@ -846,6 +865,7 @@ def run_concolic_execution(
                     cur_ce_state = ConcolicExecutionState.SOLVE_AND_EXECUTE
             case ConcolicExecutionState.SOLVE_AND_EXECUTE:
                 # wait for all submitted test cases to finish
+                print_phase("SOLVE & EXECUTE (waiting for all tasks to complete)")
                 logger.info(
                     f"Waiting for all submitted test cases to finish... (Round #{round_cnt})"
                 )
@@ -860,6 +880,7 @@ def run_concolic_execution(
                 # this iteration is finished, do some clean up and go to next iteration
 
                 # update the successful generation count of the src testcase
+                print_phase("RESULTS")
                 for tc in under_gen_tcs:
                     if tc.is_valuable():
                         src_testcase.successful_generation_cnt += 1
@@ -878,9 +899,13 @@ def run_concolic_execution(
                 under_gen_tc_msg_thread.clear()
                 under_gen_tcs.clear()
 
+                stats_msg = testcase_manager.get_statistics()[1]
                 logger.info(
-                    f"{testcase_manager.get_statistics()[1]}\nCrash count: {crash_cnt}, hang count: {hang_cnt}"
+                    f"{stats_msg}\nCrash count: {crash_cnt}, hang count: {hang_cnt}"
                 )
+                print_step(stats_msg)
+                if crash_cnt > 0 or hang_cnt > 0:
+                    print_step(f"Crashes: {crash_cnt}, Hangs: {hang_cnt}")
 
                 # state transition
                 cur_ce_state = ConcolicExecutionState.SELECT

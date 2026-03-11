@@ -9,6 +9,7 @@ from loguru import logger
 
 from app.agents.common import ExecutionInformation
 from app.agents.coverage import Coverage
+from app.log import print_tool_call
 from app.utils.utils import get_project_dir
 
 _SELECT_TARGET_BRANCH_DESCRIPTION = f"""Use this tool to select a target branch for further exploration in concolic execution. Your primary goal is to improve the overall test coverage of the project. Therefore, you should select branches that are likely to lead to code coverage contribution or complex program behaviors HAVE NOT been covered by existing test cases.
@@ -238,6 +239,12 @@ def process_target_branch_selection(
 
     logger.info(
         f"Target branch selected: {target_branch}\nJustification: {justification}\nExpected covered lines: {file_path}:{start}-{end}"
+    )
+    print_tool_call(
+        "Target Branch Selected",
+        f"**Target:** `{target_branch}`\n\n**Justification:** {justification}\n\n**Expected lines:** {file_path}:{start}-{end}",
+        icon="🎯",
+        func_name="select_target_branch",
     )
 
     return (

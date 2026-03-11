@@ -5,6 +5,8 @@ Tool for generating path constraints in concolic execution.
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 from loguru import logger
 
+from app.log import print_tool_call
+
 _GENERATE_PATH_CONSTRAINT_DESCRIPTION = """Use this tool to generate the symbolic constraints required to reach the CURRENTLY selected target branch.
 
 Your constraints should:
@@ -84,6 +86,12 @@ def process_path_constraint_generation(
 
     else:
         logger.info(f"Path constraint generated: {path_constraint}")
+        print_tool_call(
+            "Path Constraint Generated",
+            f"**For branch:** `{selected_branch}`\n\n{path_constraint}",
+            icon="📐",
+            func_name="generate_path_constraint",
+        )
 
         return (
             f'Path constraint for "{selected_branch}" successfully generated and recorded.',

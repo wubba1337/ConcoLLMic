@@ -5,6 +5,7 @@ Tool for providing the final solution in concolic execution.
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 from loguru import logger
 
+from app.log import print_tool_call
 from app.utils.utils import run_target
 
 _SOLUTION_DESCRIPTION = """Use this tool to provide your FINAL solution to the path constraint. AVOID using other tools to provide the final solution.
@@ -74,6 +75,12 @@ def process_solution(
 
     if not is_satisfiable:
         logger.info("Solution provided: UNSATISFIABLE")
+        print_tool_call(
+            "Solution Provided",
+            "**UNSATISFIABLE** — Constraints cannot be satisfied",
+            icon="❌",
+            func_name="provide_solution",
+        )
         return "UNSATISFIABLE constraints acknowledged.", False, None
 
     if not python_execution:
@@ -97,4 +104,10 @@ def process_solution(
         return error_msg, True, None
 
     logger.info("Solution provided with `execute_program` function")
+    print_tool_call(
+        "Solution Provided",
+        f"**SATISFIABLE** ✓\n\n```python\n{python_execution}\n```",
+        icon="✅",
+        func_name="provide_solution",
+    )
     return "Solution accepted.", True, python_execution

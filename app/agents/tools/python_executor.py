@@ -11,6 +11,7 @@ from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChun
 from loguru import logger
 
 from app.agents.common import filter_instr_print
+from app.log import print_tool_call
 from app.utils.utils import get_project_dir
 
 EXECUTION_TIMEOUT = 10  # 10 seconds for the Python code execution
@@ -159,6 +160,12 @@ def process_python_executor(python_code: str | None) -> tuple[str, bool]:
     temp_file = None
 
     logger.debug("LLM requested to execute Python code:\n{}", python_code)
+    print_tool_call(
+        "Python Executor",
+        f"```python\n{python_code}\n```",
+        icon="🐍",
+        func_name="execute_python",
+    )
 
     try:
         # Create temporary file

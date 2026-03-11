@@ -45,8 +45,8 @@ def setup_logging(log_dir: str) -> str:
         handlers=[
             {
                 "sink": sys.stdout,
-                "level": "INFO",
-            }  # Modified the default log output level to INFO
+                "level": "WARNING",
+            }  # Terminal only shows warnings/errors; all INFO goes to log file only
         ]
     )
 
@@ -72,8 +72,11 @@ def print_log_summary(log_file_path: str):
 
     TOKEN = " LOG SUMMARY "
 
-    logger.info("=" * 25 + TOKEN + "=" * 25)
-    # Use the current session's log file directly
+    def _out(msg):
+        logger.info(msg)
+        print(msg)
+
+    _out("=" * 25 + TOKEN + "=" * 25)
     if os.path.exists(log_file_path):
         try:
             with open(log_file_path, encoding="utf-8") as f:
@@ -91,56 +94,43 @@ def print_log_summary(log_file_path: str):
         except Exception as e:
             logger.error(f"Error reading log file {log_file_path}: {e}")
 
-        # Print actual warning and error lines
         if warning_lines:
-            logger.info("\033[33mWARNINGS:\033[0m")
+            _out("\033[33mWARNINGS:\033[0m")
             for line_no, line in warning_lines:
-                logger.info(f"\t\033[33m{line_no}: {line}\033[0m")
+                _out(f"\t\033[33m{line_no}: {line}\033[0m")
 
         if error_lines:
-            logger.info("\033[31mERRORS:\033[0m")
+            _out("\033[31mERRORS:\033[0m")
             for line_no, line in error_lines:
-                logger.info(f"\t\033[31m{line_no}: {line}\033[0m")
+                _out(f"\t\033[31m{line_no}: {line}\033[0m")
 
-        logger.info("-" * (50 + len(TOKEN)))
-
-        # Print summary with colored output
-
-        logger.info(f"Log file: \033[36m{log_file_path}\033[0m")
+        _out("-" * (50 + len(TOKEN)))
+        _out(f"Log file: \033[36m{log_file_path}\033[0m")
 
         if warning_count > 0:
-            logger.info(
-                f"\tWarnings: \033[33m{warning_count}\033[0m"
-            )  # Yellow for warnings
+            _out(f"\tWarnings: \033[33m{warning_count}\033[0m")
         else:
-            logger.info("\tWarnings: \033[32m0\033[0m")  # Green for zero warnings
+            _out("\tWarnings: \033[32m0\033[0m")
 
         if error_count > 0:
-            logger.info(f"\tErrors: \033[31m{error_count}\033[0m")  # Red for errors
+            _out(f"\tErrors: \033[31m{error_count}\033[0m")
         else:
-            logger.info("\tErrors: \033[32m0\033[0m")  # Green for zero errors
+            _out("\tErrors: \033[32m0\033[0m")
 
-        # Print total retry attempts
-        if get_total_retry_attempts() > 0:
-            logger.info(
-                f"Total LLM Retry Attempts: \033[35m{get_total_retry_attempts()}\033[0m"
-            )  # Magenta for retries
-        else:
-            logger.info(
-                f"Total LLM Retry Attempts: \033[32m{get_total_retry_attempts()}\033[0m"
-            )  # Green for zero retries
+        retry_count = get_total_retry_attempts()
+        color = "\033[35m" if retry_count > 0 else "\033[32m"
+        _out(f"Total LLM Retry Attempts: {color}{retry_count}\033[0m")
 
     else:
-        logger.info("Log Summary: No log file found")
+        _out("Log Summary: No log file found")
 
-    logger.info("=" * (50 + len(TOKEN)))
+    _out("=" * (50 + len(TOKEN)))
 
 
 def signal_handler(signum, frame, log_file_path: str):
     """Handle termination signals"""
-    logger.info(
-        "\033[1;34mReceived termination signal, exiting...\033[0m"
-    )  # Bold blue for termination message
+    logger.info("Received termination signal, exiting...")
+    print("\n\033[1;34mReceived termination signal, exiting...\033[0m")
     print_log_summary(log_file_path)
     sys.exit(0)
 

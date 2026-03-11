@@ -5,6 +5,8 @@ Tool for intermediate reasoning and thinking through complex problems.
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 from loguru import logger
 
+from app.log import print_tool_call
+
 _THINK_DESCRIPTION = """Use the tool to think through complex problems step by step. This allows you to organize your thoughts before making a decision or getting a final answer. It will not obtain new information or make any changes to the repository, but just log the thought. Use it when complex reasoning or brainstorming is needed.
 
 This is particularly useful for:
@@ -53,4 +55,5 @@ def process_thinking_tool(reasoning: str | None) -> str:
     #     )
 
     logger.info(f"Thinking process: {reasoning}")
+    print_tool_call("Agent Thinking", reasoning or "", icon="💭", func_name="think")
     return "I've recorded your reasoning."

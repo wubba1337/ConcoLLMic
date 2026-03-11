@@ -14,8 +14,9 @@ from litellm.exceptions import (
     ContentPolicyViolationError as LiteLLMContentPolicyViolationError,
 )
 from litellm.utils import Choices, Message, ModelResponse
+from loguru import logger
 
-from app.log import log_and_cprint, log_and_print
+from app.log import log_and_print, print_usage_compact
 from app.model import common
 from app.model.common import (
     ClaudeContentPolicyViolation,
@@ -167,11 +168,11 @@ class AnthropicModel(Model):
                 resp_msg.tool_calls if hasattr(resp_msg, "tool_calls") else None
             )
 
-            log_and_cprint(
+            logger.info(
                 f"Model ({self.name}) API request usage info: "
                 f"{{input_tokens={input_tokens}, output_tokens={output_tokens}, cache_read_tokens={cache_read_tokens}, cache_write_tokens={cache_creation_tokens}}}, cost={cost:.6f} USD, latency={latency:.6f} seconds",
-                style="yellow",
             )
+            print_usage_compact(self.name, cost, latency)
             # total prompt tokens = input_tokens (already includes cache_read_tokens) + cache_write_tokens
             # so the price should be (input_tokens - cache_read_tokens) * input_cost + cache_write_tokens * cache_write_cost + cache_read_tokens * cache_read_cost + output_tokens * output_cost
 

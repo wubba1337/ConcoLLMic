@@ -142,6 +142,8 @@ python3 ACE.py run \
 - `--rounds`: Number of concolic execution rounds (default: unlimited until coverage plateau)
 - `--parallel_num`: Maximum number of concurrent test case generations per round
 
+> **Tip**: To observe the agent's step-by-step workflow more clearly (e.g., for demos or debugging), set `--parallel_num 1` so that each phase runs sequentially.
+
 *Output*:
 - `./out/ConcoLLMic_*.log` — detailed execution log
 - `./out/queue/id:*.yaml` — generated test cases with metadata
@@ -227,6 +229,8 @@ python3 ACE.py run \
 - `--out`: Output directory for generated test cases and logs
 - `--rounds`: Number of concolic execution rounds (default: unlimited until coverage plateau)
 - `--parallel_num`: Maximum number of concurrent test case generations per round
+
+> **Tip**: To observe the agent's step-by-step workflow more clearly (e.g., for demos or debugging), set `--parallel_num 1` so that each phase runs sequentially.
 
 *Output*:
 - `./out/ConcoLLMic_*.log` — detailed execution log
