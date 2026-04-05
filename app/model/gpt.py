@@ -24,7 +24,6 @@ from openai.types.chat.chat_completion_tool_choice_option_param import (
 )
 from openai.types.chat.completion_create_params import ResponseFormat
 
-from app.data_structures import FunctionCallIntent
 from app.log import log_and_cprint, log_and_print
 from app.model import common
 from app.model.common import Model, ModelNoResponseError, Usage
@@ -93,13 +92,16 @@ class OpenaiModel(Model):
     def extract_resp_func_calls(
         self,
         chat_completion_message: ChatCompletionMessage,
-    ) -> list[FunctionCallIntent]:
+    ) -> list[dict]:
         """
-        Given a chat completion message, extract the function calls from it.
+        Given a chat completion message, extract tool calls in the same
+        dict shape used by the rest of the agent pipeline.
+
         Args:
             chat_completion_message (ChatCompletionMessage): The chat completion message.
         Returns:
-            List[FunctionCallIntent]: A list of function calls.
+            List[dict]: A list of tool-call dictionaries with:
+                {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
         """
         result = []
         tool_calls = chat_completion_message.tool_calls
@@ -109,22 +111,20 @@ class OpenaiModel(Model):
         call: ChatCompletionMessageToolCall
         for call in tool_calls:
             called_func: OpenaiFunction = call.function
-            func_name = called_func.name
-            func_args_str = called_func.arguments
-            # maps from arg name to arg value
-            if func_args_str == "":
-                args_dict = {}
-            else:
-                try:
-                    args_dict = json.loads(func_args_str, strict=False)
-                except json.decoder.JSONDecodeError:
-                    args_dict = {}
-            func_call_intent = FunctionCallIntent(func_name, args_dict, called_func)
-            result.append(func_call_intent)
+            result.append(
+                {
+                    "id": call.id,
+                    "type": call.type,
+                    "function": {
+                        "name": called_func.name,
+                        "arguments": called_func.arguments,
+                    },
+                }
+            )
 
         return result
 
-    # FIXME: the returned type contains OpenAI specific Types, which should be avoided
+    # FIXME: keep return type abstraction provider-neutral
     def _perform_call(
         self,
         messages: list[dict],
@@ -135,11 +135,8 @@ class OpenaiModel(Model):
         **kwargs,
     ) -> tuple[
         str,
-        list[ChatCompletionMessageToolCall] | None,
-        list[FunctionCallIntent],
-        float,
-        int,
-        int,
+        list[dict],
+        Usage,
     ]:
         """
         Calls the openai API to generate completions for the given inputs.
@@ -157,6 +154,18 @@ class OpenaiModel(Model):
         """
         if temperature is None:
             temperature = common.MODEL_TEMP
+
+        # Normalize tool selection semantics across providers.
+        # Anthropic/litellm path may pass tool_choice="any", while OpenAI Chat Completions
+        # expects: "none" | "auto" | "required" (or a specific function object).
+        openai_tool_choice = kwargs.pop("tool_choice", None)
+        if openai_tool_choice == "any":
+            openai_tool_choice = "required"
+
+        # If no tools are provided, drop tool-specific controls to avoid API 400s.
+        if not tools:
+            kwargs.pop("parallel_tool_calls", None)
+            openai_tool_choice = None
 
         assert self.client is not None
         try:
@@ -188,11 +197,17 @@ class OpenaiModel(Model):
                     **kwargs,
                 )
             else:
+                tool_choice = (
+                    cast(ChatCompletionToolChoiceOptionParam, openai_tool_choice)
+                    if openai_tool_choice is not None
+                    else NOT_GIVEN
+                )
                 start_time = time.time()
                 response: ChatCompletion = self.client.chat.completions.create(
                     model=self.name,
                     messages=messages,  # type: ignore
                     tools=tools if tools is not None else NOT_GIVEN,  # type: ignore
+                    tool_choice=tool_choice,
                     temperature=temperature if temperature is not None else NOT_GIVEN,
                     response_format=cast(ResponseFormat, {"type": response_format}),
                     max_tokens=(
@@ -267,11 +282,8 @@ class Gpt_o1mini(OpenaiModel):
         **kwargs,
     ) -> tuple[
         str,
-        list[ChatCompletionMessageToolCall] | None,
-        list[FunctionCallIntent],
-        float,
-        int,
-        int,
+        list[dict],
+        Usage,
     ]:
         if response_format == "json_object":
             last_content = messages[-1]["content"]

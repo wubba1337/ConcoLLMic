@@ -9,7 +9,7 @@ import sys
 import time
 from typing import Any
 
-from anthropic import Anthropic
+from litellm import token_counter
 from loguru import logger
 
 PROJECT_DIR = ""
@@ -1153,14 +1153,28 @@ def detected_crash(stderr: str, returncode: int) -> tuple[bool, str]:
 
 
 def estimate_text_token(
-    text: str | None, model: str = "claude-sonnet-4-5-20250929"
+    text: str | None, model: str | None = "claude-sonnet-4-5-20250929"
 ) -> int:
     """
-    Estimate the number of tokens in a text.
+    Estimate the number of tokens in a text using local tokenization.
+    This avoids provider-specific API calls (e.g., Anthropic count_tokens)
+    so runs can proceed with either OpenAI or Anthropic credentials.
     """
-    client = Anthropic()
+    if not text:
+        return 0
 
-    count = client.beta.messages.count_tokens(
-        model=model, messages=[{"role": "user", "content": text}]
-    )
-    return count.input_tokens
+    model_name = model
+    if model_name is None:
+        # Late import avoids potential circular import at module load time.
+        try:
+            from app.model import common as model_common
+
+            selected_model = getattr(model_common, "SELECTED_MODEL", None)
+            model_name = getattr(selected_model, "name", None)
+        except Exception:
+            model_name = None
+
+    if not model_name:
+        model_name = "gpt-4o-2024-11-20"
+
+    return int(token_counter(model=model_name, text=text))
