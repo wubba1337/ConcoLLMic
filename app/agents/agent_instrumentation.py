@@ -32,8 +32,8 @@ from app.agents.tools import (
     process_report_functions,
 )
 from app.data_structures import MessageThread
-from app.model import claude
-from app.model.common import Usage
+from app.model import common
+from app.model.common import Model, Usage
 from app.utils.utils import (
     detect_language,
     format_code,
@@ -172,6 +172,16 @@ def _str_block_id(block_id: tuple[str, int]) -> str:
     return f"{block_id[0]} {block_id[1]}"
 
 
+def _is_likely_commented_trace_line(line: str) -> bool:
+    stripped = line.strip()
+    return (
+        stripped.startswith("//")
+        or stripped.startswith("#")
+        or stripped.startswith("/*")
+        or stripped.startswith("*")
+    )
+
+
 def check_instrumentation(instrumented_code: str) -> tuple[bool, str]:
     """
     Check if the instrumentation is correct.
@@ -192,6 +202,7 @@ def check_instrumentation(instrumented_code: str) -> tuple[bool, str]:
     all_blocks: dict[tuple[str, int], list[tuple[int, str]]] = (
         {}
     )  # block_id (func_name, bb_id) -> list of (line_num, action), action is "enter" or "exit"
+    auto_fixed_mismatch = False
 
     # First pass - collect all block information
     for line_num, line in enumerate(instrumented_code_lines):
@@ -209,6 +220,34 @@ def check_instrumentation(instrumented_code: str) -> tuple[bool, str]:
                     all_blocks[block_id].append((line_num, "exit"))
                     active_blocks.pop()
                 else:
+                    # Tolerance for model mistakes: if exit markers are commented out and the
+                    # exit block id is wrong, fix it to the currently active block.
+                    # This preserves strict checking for active (executable) mismatches.
+                    if len(active_blocks) > 0 and _is_likely_commented_trace_line(line):
+                        expected_block_id = active_blocks[-1]
+                        old_line = instrumented_code_lines[line_num]
+                        new_line = re.sub(
+                            TRACE_PATTERN,
+                            lambda m: m.group(0).replace(
+                                f"{m.group(1)} {m.group(2)} {m.group(3)}",
+                                f"{m.group(1)} {expected_block_id[0]} {expected_block_id[1]}",
+                            ),
+                            old_line,
+                            count=1,
+                        )
+                        instrumented_code_lines[line_num] = new_line
+                        if expected_block_id not in all_blocks:
+                            all_blocks[expected_block_id] = []
+                        all_blocks[expected_block_id].append((line_num, "exit"))
+                        active_blocks.pop()
+                        auto_fixed_mismatch = True
+                        logger.warning(
+                            'Auto-fixed mismatched commented "exit" at line {}: expected block "{}"',
+                            line_num + 1,
+                            _str_block_id(expected_block_id),
+                        )
+                        continue
+
                     error_msg = (
                         f'Block ID mismatch at line {line_num+1}("{line.strip()}"): '
                     )
@@ -260,10 +299,12 @@ def check_instrumentation(instrumented_code: str) -> tuple[bool, str]:
                     new_id_num = random.randint(100, 5000)
                     # Check if ID already exists in original code
                     specific_pattern = (
-                        f"(enter|exit)\\s+{re.escape(block_id[0])}\\s+{new_id_num}"
+                        f"(enter|exit)\\s+{re.escape(block_id[0])}\\s+{new_id_num}\\b"
                     )
                     if (new_id_num not in generated_ids) and (
-                        not re.search(specific_pattern, instrumented_code)
+                        not re.search(
+                            specific_pattern, "\n".join(instrumented_code_lines)
+                        )
                     ):
                         generated_ids.add(new_id_num)
                         break
@@ -325,6 +366,8 @@ def check_instrumentation(instrumented_code: str) -> tuple[bool, str]:
         return True, "\n".join(new_lines)
 
     else:
+        if auto_fixed_mismatch:
+            return True, "\n".join(instrumented_code_lines)
         return True, instrumented_code
 
 
@@ -390,8 +433,10 @@ class InstrumentationAgent:
     # retry times for instrumentation to pass the `check_instrumentation`
     INSTRUMENTATION_RETRY_TIMES = 3
 
-    def __init__(self, model=claude.Claude4_5Sonnet(max_output_token=32768)):
-        self.model = model
+    def __init__(self, model: Model | None = None):
+        # Follow the globally selected runtime model (set in ACE.setup_model()).
+        # This keeps instrumentation aligned with OpenAI/Anthropic selection.
+        self.model = model or common.SELECTED_MODEL
         self.model.setup()
 
     def cleanup(self):

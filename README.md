@@ -65,6 +65,7 @@ The number of representable FP values in the range must be ≤ 20.
 
 - Python 3.10 or higher
 - API key for Claude Sonnet (from Anthropic)
+- For binary-only Frida instrumentation: `readelf` (from `binutils`)
 
 ### Installation
 
@@ -74,18 +75,25 @@ git clone https://github.com/ConcoLLMic/ConcoLLMic.git
 cd ConcoLLMic
 ```
 
-2. **Install Python dependencies**
+2. **Install system dependencies (Linux, for binary-only Frida flow)**
+```bash
+sudo apt-get update
+sudo apt-get install -y binutils
+```
+
+3. **Install Python dependencies**
 ```bash
 pip install -r requirements.txt
 pip install -r requirements-dev.txt # optional
 ```
 
-3. **Set up your API key**
+4. **Set up your API key**
 ```bash
 export ANTHROPIC_API_KEY="your_api_key_here"
 ```
 
 By default, ConcoLLMic uses Claude 4.5 Sonnet. You can configure other models in [`ACE.py`](ACE.py) (see `setup_model()`).
+For `instrument --frida_only`, no API key is required.
 
 ### Running Your First Example
 
@@ -341,4 +349,3 @@ For commercial licensing inquiries, contact:
   organization={IEEE}
 }
 ```
-

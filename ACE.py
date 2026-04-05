@@ -138,7 +138,7 @@ def signal_handler(signum, frame, log_file_path: str):
 def setup_model():
     """Setup and initialize model"""
     register_all_models()
-    set_model("claude-sonnet-4-5-20250929")
+    set_model("gpt-4o-2024-11-20")
 
 
 def initialize_settings(log_dir: str = LOG_DIR):
@@ -197,16 +197,35 @@ def main():
     args = parse_arguments()
 
     if args.command == "instrument":
-        initialize_settings()
+        if args.frida_only:
+            # Frida-only generation does not call any LLM and should not require API keys.
+            setup_logging(LOG_DIR)
+        else:
+            initialize_settings()
 
         # Perform instrumentation phase
         instrument_code(
-            src_dir=os.path.normpath(args.src_dir),
+            src_dir=(os.path.normpath(args.src_dir) if args.src_dir else None),
             out_dir=os.path.normpath(args.out_dir),
             instr_languages=args.instr_languages,
             exclude_dirs=args.exclude_dirs,
             parallel_num=args.parallel_num,
             chunk_size=args.chunk_size,
+            frida_binary=(
+                os.path.normpath(args.frida_binary) if args.frida_binary else None
+            ),
+            frida_script_out=(
+                os.path.normpath(args.frida_script_out)
+                if args.frida_script_out
+                else None
+            ),
+            frida_module=args.frida_module,
+            frida_only=args.frida_only,
+            frida_max_hooks=args.frida_max_hooks,
+            frida_include_regex=args.frida_include_regex,
+            frida_exclude_regex=args.frida_exclude_regex,
+            frida_target_functions=args.frida_target_functions,
+            frida_mode=args.frida_mode,
         )
 
     elif args.command == "run":

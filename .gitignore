@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -15,3 +16,7 @@ out/
 */*/*.o
 coverage.csv
 .DS_Store
+validate_brackets_plain
+code_example/bin/validate_brackets_plain
+.instrument_info
+test_asan

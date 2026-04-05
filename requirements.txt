@@ -16,3 +16,5 @@ ruamel.yaml==0.18.10
 dill==0.3.9
 anthropic==0.75.0
 transformers==4.37.2
+frida
+frida-tools

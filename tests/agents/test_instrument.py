@@ -199,6 +199,29 @@ int validate_brackets(const char *filename) {
     ), "Error message should indicate a block ID mismatch"
 
 
+def test_check_instrumentation_autofix_commented_exit_mismatch():
+    """
+    Commented-out mismatched exit markers should be auto-corrected to the active block.
+    Active (non-commented) mismatches remain hard failures (covered by previous test).
+    """
+    instrumented_code = """int f() {
+    fprintf(stderr, "enter f 1\\n");
+    if (1) {
+        fprintf(stderr, "enter f 2\\n");
+        // body
+        // fprintf(stderr, "exit f 9\\n");
+    }
+    // fprintf(stderr, "exit f 1\\n");
+    return 0;
+}
+"""
+
+    is_correct, result = check_instrumentation(instrumented_code)
+
+    assert is_correct, "Commented mismatch should be auto-repaired"
+    assert 'exit f 2\\n' in result, "Mismatched commented exit should be rewritten"
+
+
 instrumentation_with_multiple_exit_statements = """static int
 _bc_do_compare ( bc_num n1, bc_num n2, int use_sign, int ignore_last )
 {
