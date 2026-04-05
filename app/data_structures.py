@@ -180,23 +180,34 @@ class MessageThread:
         )
 
     def add_model(
-        self, message: str | None, tools: list[ChatCompletionMessageToolCall] = []
+        self,
+        message: str | None,
+        tools: list[dict | ChatCompletionMessageToolCall] | None = None,
     ):
         if tools is None or len(tools) == 0:
             self.add_message("assistant", message)
             return
 
-        # let's serialize tools into json first
+        # Normalize provider-specific tool-call objects into OpenAI-style json dicts.
         json_tools = []
         for tool in tools:
             this_tool_dict = {}
-            this_tool_dict["id"] = tool.id
-            this_tool_dict["type"] = tool.type
-            # now serialize function as well
-            func_obj: OpenaiFunction = tool.function
-            func_args: str = func_obj.arguments
-            func_name: str = func_obj.name
-            this_tool_dict["function"] = {"name": func_name, "arguments": func_args}
+            if isinstance(tool, dict):
+                function_payload = tool.get("function", {})
+                this_tool_dict["id"] = tool.get("id")
+                this_tool_dict["type"] = tool.get("type", "function")
+                this_tool_dict["function"] = {
+                    "name": function_payload.get("name", ""),
+                    "arguments": function_payload.get("arguments", "{}"),
+                }
+            else:
+                this_tool_dict["id"] = tool.id
+                this_tool_dict["type"] = tool.type
+                func_obj: OpenaiFunction = tool.function
+                this_tool_dict["function"] = {
+                    "name": func_obj.name,
+                    "arguments": func_obj.arguments,
+                }
             json_tools.append(this_tool_dict)
 
         if json_tools == []:
