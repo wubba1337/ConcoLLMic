@@ -11,6 +11,7 @@ import dill
 from loguru import logger
 
 from app.agents.trace import TraceCollector
+from app.utils.utils import get_project_dir
 
 
 class Coverage:
@@ -33,6 +34,7 @@ class Coverage:
         self.file2cov: dict[str, TraceCollector] = (
             {}
         )  # relative file path (containing project dir) -> trace collector
+        self.ignored_missing_paths: set[str] = set()
 
     def get_file_coverage(self, file_path) -> TraceCollector | None:
         """Get a TraceCollector for a specific file.
@@ -45,7 +47,28 @@ class Coverage:
         """
         file_path = os.path.normpath(file_path)
         if file_path not in self.file2cov:
-            self.file2cov[file_path] = TraceCollector(file_path)
+            project_dir = get_project_dir()
+            path_exists = os.path.exists(file_path) or (
+                bool(project_dir) and os.path.exists(os.path.join(project_dir, file_path))
+            )
+            if not path_exists:
+                if file_path not in self.ignored_missing_paths:
+                    logger.warning(
+                        "Ignoring trace for unknown file path (not found in project): {}",
+                        file_path,
+                    )
+                    self.ignored_missing_paths.add(file_path)
+                return None
+            try:
+                self.file2cov[file_path] = TraceCollector(file_path)
+            except FileNotFoundError:
+                if file_path not in self.ignored_missing_paths:
+                    logger.warning(
+                        "Ignoring trace for unknown file path (not found in project): {}",
+                        file_path,
+                    )
+                    self.ignored_missing_paths.add(file_path)
+                return None
         return self.file2cov.get(file_path)
 
     def collect_trace(
@@ -76,7 +99,7 @@ class Coverage:
         if tc:
             return tc.collect_trace(trace, target_lines, add_coverage)
         else:
-            logger.error(f"Coverage information not available for file: {file_path}")
+            logger.warning(f"Coverage information not available for file: {file_path}")
             return 0, False, ""
 
     def has_coverage_for(self, file_path):

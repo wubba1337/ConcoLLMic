@@ -8,6 +8,8 @@ from loguru import logger
 from app.log import print_tool_call
 from app.utils.utils import run_target
 
+VALIDATION_TIMEOUT_SECONDS = 10
+
 _SOLUTION_DESCRIPTION = """Use this tool to provide your FINAL solution to the path constraint. AVOID using other tools to provide the final solution.
 
 Your solution should:
@@ -96,7 +98,7 @@ def process_solution(
 
     # Verify if the Python execution runs successfully using run_target
     result = run_target(
-        python_execution, timeout=2
+        python_execution, timeout=VALIDATION_TIMEOUT_SECONDS
     )  # we don't need to wait for the program to finish, just check if the Python execution is successful
     if not result["exec_success"]:
         error_msg = f"Running the given solution failed, error: {result['exec_error']}"

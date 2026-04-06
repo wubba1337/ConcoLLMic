@@ -262,6 +262,7 @@ def main():
             resume_in=(os.path.normpath(args.resume_in) if args.resume_in else None),
             plateau_slot=args.plateau_slot,
             parallel_num=args.parallel_num,
+            binary_only=args.binary_only,
         )
 
     elif args.command == "instrument_data":

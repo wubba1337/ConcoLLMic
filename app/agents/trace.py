@@ -333,9 +333,13 @@ class TraceCollector:
         new_covered_lines = 0
         new_covered_line_contents: dict[int, str] = {}
         executed_blocks = get_executed_blocks(trace_str)
+        unknown_blocks: set[tuple[str, int]] = set()
         if add_coverage:
             GLOBAL_BLOCK_first_covered = False
             for block in executed_blocks:
+                if block != GLOBAL_BLOCK and block not in self.block2real_lines:
+                    unknown_blocks.add(block)
+                    continue
                 prev_cov = self.block2cov.get(block, 0)
                 self.block2cov[block] = prev_cov + 1
                 if block == GLOBAL_BLOCK:
@@ -364,6 +368,15 @@ class TraceCollector:
                 assert (
                     new_covered_lines > 0
                 ), f"File {self.file_path} is newly covered but the count of newly covered lines is 0"
+
+            if unknown_blocks:
+                preview = ", ".join(str(block) for block in sorted(unknown_blocks)[:8])
+                logger.warning(
+                    "Ignored {} unknown executed blocks in {} (sample: {})",
+                    len(unknown_blocks),
+                    self.file_path,
+                    preview,
+                )
 
             # sort the dict new_covered_line_contents by the real line number
             new_covered_line_contents = dict(

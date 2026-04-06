@@ -4,6 +4,7 @@ import tempfile
 
 import pytest
 
+import app.agents.coverage as coverage_module
 from app.agents.coverage import Coverage
 
 
@@ -149,3 +150,35 @@ class TestCoverage:
         assert (
             loaded is Coverage.get_instance()
         ), "Should return default instance on load failure"
+
+    def test_collect_trace_ignores_unknown_file_path(self):
+        Coverage._instance = None
+        coverage = Coverage.get_instance()
+
+        new_lines, is_target_covered, execution_summary = coverage.collect_trace(
+            "validate_brackets_plain",
+            "[validate_brackets_plain] enter validate_brackets 1",
+        )
+
+        assert new_lines == 0
+        assert is_target_covered is False
+        assert execution_summary == ""
+        assert not coverage.has_coverage_for("validate_brackets_plain")
+
+    def test_get_file_coverage_skips_missing_without_constructing_collector(
+        self, monkeypatch
+    ):
+        Coverage._instance = None
+        coverage = Coverage.get_instance()
+
+        called = False
+
+        def _fake_trace_collector(_file_path):
+            nonlocal called
+            called = True
+            raise AssertionError("TraceCollector should not be constructed")
+
+        monkeypatch.setattr(coverage_module, "TraceCollector", _fake_trace_collector)
+        tc = coverage.get_file_coverage("validate_brackets_plain")
+        assert tc is None
+        assert called is False

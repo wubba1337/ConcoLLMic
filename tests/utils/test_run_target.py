@@ -285,6 +285,37 @@ def execute_program(timeout: int) -> tuple[str, int]:
     assert result["target_timeout"] is False
 
 
+def test_frida_wrapper_process_not_found_traceback_is_not_crash():
+    code = """
+def execute_program(timeout: int) -> tuple[str, int]:
+    stderr = '''
+Traceback (most recent call last):
+  File "/home/user/.local/bin/frida", line 8, in <module>
+  File "/home/user/.local/lib/python3.12/site-packages/frida_tools/repl.py", line 1307, in main
+frida.ProcessNotFoundError: unable to find process with pid 12345
+'''
+    return stderr, 1
+    """
+    result = run_target(code, timeout=1)
+    assert result["exec_success"] is True
+    assert result["target_crashed"] is False
+    assert result["target_return_code"] == 1
+
+
+def test_frida_process_terminated_banner_is_not_crash_with_zero_rc():
+    code = """
+def execute_program(timeout: int) -> tuple[str, int]:
+    stderr = '''Spawned `../bin/validate_brackets_plain /tmp/tmp123`. Resuming main thread!
+Process terminated
+[frida-static] attached 1/1 function hooks on module validate_brackets_plain'''
+    return stderr, 0
+    """
+    result = run_target(code, timeout=1)
+    assert result["exec_success"] is True
+    assert result["target_crashed"] is False
+    assert result["target_return_code"] == 0
+
+
 def test_timeout():
     """Test execution with timeout."""
     code = """

@@ -20,3 +20,6 @@ validate_brackets_plain
 code_example/bin/validate_brackets_plain
 .instrument_info
 test_asan
+frida_hooks.js
+frida_hooks.js.symbols.txt
+frida_trace_map.json

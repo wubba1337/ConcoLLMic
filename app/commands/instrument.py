@@ -12,10 +12,12 @@ import subprocess
 import threading
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 
 import yaml
 from loguru import logger
 
+from app.agents.common import FILE_TRACE_PATTERN
 from app.agents.agent_instrumentation import InstrumentationAgent
 from app.utils.utils import (
     compress_paths,
@@ -25,6 +27,7 @@ from app.utils.utils import (
 )
 
 INSTRUMENTATION_INFO_FILE = ".instrument_info"
+FRIDA_TRACE_MAP_FILE = "frida_trace_map.json"
 
 
 def _run_capture(cmd: list[str]) -> str:
@@ -118,42 +121,544 @@ def _extract_function_symbols(binary_path: str) -> list[str]:
     )
 
 
-def _generate_frida_function_hook_script_content(
+def _demangle_symbol_name(symbol: str) -> str:
+    symbol = _normalize_symbol_name(symbol)
+    if not symbol:
+        return symbol
+    try:
+        demangled = _run_capture(["c++filt", symbol]).strip()
+        return demangled or symbol
+    except Exception:
+        return symbol
+
+
+def _extract_function_basename(function_name: str) -> str:
+    """
+    Normalize a symbol / demangled signature to a short function basename.
+    Examples:
+      "_Z17validate_bracketsPKc" -> "_Z17validate_bracketsPKc" (fallback path)
+      "validate_brackets(char const*)" -> "validate_brackets"
+      "ns::Foo::bar(int)" -> "bar"
+    """
+    if not function_name:
+        return ""
+    short = function_name.strip()
+    if "(" in short:
+        short = short.split("(", 1)[0].strip()
+    if "::" in short:
+        short = short.rsplit("::", 1)[-1]
+    return short
+
+
+def _collect_instrumented_function_blocks(project_dir: str) -> dict[str, dict[str, Any]]:
+    """
+    Scan instrumented source files and extract ACE function/block metadata.
+
+    Returns:
+      {
+        "<file_tag>::<func_name>": {
+          "file": "<file_tag>",
+          "function": "<func_name>",
+          "block_ids": [1,2,...],
+          "block_count": N
+        },
+        ...
+      }
+    """
+    result: dict[str, dict[str, Any]] = {}
+
+    for file_path in list_all_files(project_dir, recursive=True):
+        rel_path = os.path.relpath(file_path, project_dir)
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            # Ignore binary/unreadable files when building trace map.
+            continue
+
+        for raw_line in lines:
+            matches = re.findall(FILE_TRACE_PATTERN, raw_line.strip())
+            if not matches:
+                continue
+            for file_tag, action, func_name, block_id in matches:
+                if action != "enter":
+                    continue
+                key = f"{file_tag}::{func_name}"
+                if key not in result:
+                    result[key] = {
+                        "file": file_tag,
+                        "function": func_name,
+                        "block_ids": set(),
+                        "source_file_relpath": rel_path,
+                    }
+                result[key]["block_ids"].add(int(block_id))
+
+    # Normalize sets to sorted lists.
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, metadata in result.items():
+        block_ids = sorted(metadata["block_ids"])
+        normalized[key] = {
+            "file": metadata["file"],
+            "function": metadata["function"],
+            "block_ids": block_ids,
+            "block_count": len(block_ids),
+            "source_file_relpath": metadata["source_file_relpath"],
+        }
+    return normalized
+
+
+def _build_frida_trace_map(
+    *,
+    binary_path: str,
     module_name: str,
+    frida_mode: str,
     symbols: list[str],
+    project_dir: str | None,
+    expected_event_space: dict[str, int] | None = None,
+    hook_specs: list[dict[str, Any]] | None = None,
+    image_base: int | None = None,
+) -> dict[str, Any]:
+    """
+    Build a Frida->ACE trace mapping artifact.
+    This artifact is consumed by the Frida adapter harness in Step 2.
+    """
+    function_blocks = (
+        _collect_instrumented_function_blocks(project_dir) if project_dir else {}
+    )
+
+    # Index instrumented functions by basename for symbol matching.
+    basename_to_candidates: dict[str, list[dict[str, Any]]] = {}
+    for metadata in function_blocks.values():
+        basename = _extract_function_basename(metadata["function"])
+        basename_to_candidates.setdefault(basename, []).append(metadata)
+
+    symbol_mappings: dict[str, dict[str, Any]] = {}
+    frida_function_id_to_ace_block: dict[str, int] = {}
+
+    for idx, sym in enumerate(symbols, start=1):
+        demangled = _demangle_symbol_name(sym)
+        candidate_names = [
+            _extract_function_basename(demangled),
+            _extract_function_basename(sym),
+            _normalize_symbol_name(sym),
+        ]
+
+        chosen: dict[str, Any] | None = None
+        for cname in candidate_names:
+            if not cname:
+                continue
+            candidates = basename_to_candidates.get(cname, [])
+            if not candidates:
+                continue
+            # Deterministic tie-break: prefer more ACE blocks, then lexicographically.
+            chosen = sorted(
+                candidates,
+                key=lambda c: (-c["block_count"], c["file"], c["function"]),
+            )[0]
+            break
+
+        mapping_entry: dict[str, Any] = {
+            "frida_symbol": sym,
+            "demangled_symbol": demangled,
+            "frida_function_id": idx,
+            "ace_file": None,
+            "ace_function": None,
+            "ace_block_ids": [],
+            "ace_mapping_available": False,
+        }
+
+        if chosen:
+            mapping_entry.update(
+                {
+                    "ace_file": chosen["file"],
+                    "ace_function": chosen["function"],
+                    "ace_block_ids": chosen["block_ids"],
+                    "ace_mapping_available": len(chosen["block_ids"]) > 0,
+                }
+            )
+            if chosen["block_ids"]:
+                # Function mode uses deterministic frida function IDs (1..N).
+                # Map them directly to the first ACE block ID.
+                frida_function_id_to_ace_block[str(idx)] = chosen["block_ids"][0]
+
+        symbol_mappings[sym] = mapping_entry
+
+    return {
+        "version": 1,
+        "generated_at": datetime.datetime.now().isoformat(),
+        "binary_path": os.path.normpath(binary_path),
+        "module_name": module_name,
+        "frida_mode": frida_mode,
+        "symbols": symbols,
+        "symbol_mappings": symbol_mappings,
+        "frida_function_id_to_ace_block_id": frida_function_id_to_ace_block,
+        "runtime_branch_mapping_policy": (
+            None
+            if frida_mode == "static_offset"
+            else "first_seen_round_robin_within_symbol"
+        ),
+        "static_id_mapping_policy": (
+            "fixed_id_per_static_offset" if frida_mode == "static_offset" else None
+        ),
+        "expected_event_space": expected_event_space or {},
+        "hook_spec_count": len(hook_specs or []),
+        "image_base": f"0x{image_base:x}" if image_base is not None else None,
+        "project_dir": os.path.normpath(project_dir) if project_dir else None,
+        "ace_function_count": len(function_blocks),
+    }
+
+
+def _save_frida_trace_map(trace_map: dict[str, Any], out_path: str) -> None:
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(trace_map, f, indent=2, ensure_ascii=False)
+
+def _get_elf_image_base(binary_path: str) -> int:
+    """
+    Return ELF image base (minimum LOAD virtual address), used to convert
+    static instruction addresses to module-relative offsets.
+    """
+    try:
+        output = _run_capture(["readelf", "-W", "-l", binary_path])
+    except Exception as e:
+        logger.warning("Failed to read ELF program headers for {}: {}", binary_path, e)
+        return 0
+
+    load_vaddrs: list[int] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0] != "LOAD":
+            continue
+        try:
+            load_vaddrs.append(int(parts[2], 16))
+        except Exception:
+            continue
+    return min(load_vaddrs) if load_vaddrs else 0
+
+
+def _is_branch_mnemonic(mnemonic: str) -> bool:
+    m = mnemonic.lower()
+    return (
+        m.startswith("j")  # x86 jcc / jmp
+        or m == "b"
+        or m.startswith("b.")
+        or m.startswith("cb")
+        or m.startswith("tb")
+        or m in {"br", "blr", "bx"}
+    )
+
+
+def _is_conditional_branch_mnemonic(mnemonic: str) -> bool:
+    m = mnemonic.lower()
+    if m.startswith("j"):
+        return m not in {"jmp", "jmpq"}
+    if m == "b":
+        return False
+    if m.startswith("b."):
+        return True
+    if m.startswith("cb") or m.startswith("tb"):
+        return True
+    if m in {"br", "blr", "bx"}:
+        return False
+    return False
+
+
+def _is_epilogue_mnemonic(mnemonic: str) -> bool:
+    """
+    Return True for instruction mnemonics that are typically function epilogues
+    or terminal returns and are poor candidates for inline interception.
+    """
+    m = mnemonic.lower().strip()
+    return m in {
+        "ret",
+        "retq",
+        "iret",
+        "iretq",
+        "leave",
+        "leaveq",
+        "sysret",
+        "sysexit",
+    }
+
+
+def _extract_direct_target_address(operand: str) -> int | None:
+    """
+    Best-effort parser for direct branch target addresses from objdump operands.
+    """
+    operand = operand.strip()
+    if not operand:
+        return None
+
+    # Common pattern: "11d4 <label>" or "0x11d4 <label>"
+    match = re.search(r"(0x[0-9a-fA-F]+|[0-9a-fA-F]+)\s*(?:<[^>]*>)?$", operand)
+    if not match:
+        return None
+    raw = match.group(1)
+    try:
+        return int(raw, 16)
+    except Exception:
+        return None
+
+
+def _disassemble_symbol_instructions(binary_path: str, symbol: str) -> list[dict[str, Any]]:
+    """
+    Disassemble a symbol and return normalized instruction records:
+      [{"address": int, "mnemonic": str, "operand": str}, ...]
+    """
+    try:
+        output = _run_capture(
+            [
+                "objdump",
+                "-d",
+                "--no-show-raw-insn",
+                f"--disassemble={symbol}",
+                binary_path,
+            ]
+        )
+    except Exception as e:
+        logger.warning("objdump failed for symbol {}: {}", symbol, e)
+        return []
+
+    instructions: list[dict[str, Any]] = []
+    insn_pattern = re.compile(
+        r"^\s*([0-9a-fA-F]+):\s+([a-zA-Z][a-zA-Z0-9._]*)\s*(.*)$"
+    )
+    for line in output.splitlines():
+        match = insn_pattern.match(line)
+        if not match:
+            continue
+        try:
+            address = int(match.group(1), 16)
+        except Exception:
+            continue
+        mnemonic = match.group(2).strip()
+        operand = match.group(3).strip()
+        instructions.append(
+            {
+                "address": address,
+                "mnemonic": mnemonic,
+                "operand": operand,
+            }
+        )
+    return instructions
+
+
+def _compute_static_offset_hook_specs(
+    binary_path: str,
+    symbols: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, int], int]:
+    """
+    Build static-offset hook specs with deterministic IDs for:
+      - function entry
+      - basic-block leaders
+      - branch instructions
+    """
+    image_base = _get_elf_image_base(binary_path)
+    hook_specs: list[dict[str, Any]] = []
+
+    next_function_id = 1
+    next_bb_id = 100000
+    next_branch_id = 200000
+
+    min_hook_instruction_bytes = 2
+
+    for symbol in symbols:
+        insns = _disassemble_symbol_instructions(binary_path, symbol)
+        if not insns:
+            logger.warning(
+                "Skipping symbol {} for static-offset hooks: no disassembly found",
+                symbol,
+            )
+            continue
+
+        insns = sorted(insns, key=lambda i: i["address"])
+        addr_set = {insn["address"] for insn in insns}
+        insn_by_addr = {insn["address"]: insn for insn in insns}
+        insn_size_by_addr: dict[int, int] = {}
+        for idx in range(len(insns) - 1):
+            cur_addr = insns[idx]["address"]
+            next_addr = insns[idx + 1]["address"]
+            delta = next_addr - cur_addr
+            # Keep only sane, positive deltas as best-effort instruction lengths.
+            if 0 < delta <= 16:
+                insn_size_by_addr[cur_addr] = delta
+
+        def _is_hookable_addr(addr: int) -> bool:
+            insn = insn_by_addr.get(addr)
+            if insn is None:
+                return False
+            if _is_epilogue_mnemonic(insn["mnemonic"]):
+                return False
+            insn_size = insn_size_by_addr.get(addr)
+            # Skip tiny 1-byte instruction slots (e.g., `ret`, some epilogues)
+            # when size is known. This avoids fragile hook sites.
+            if (
+                insn_size is not None
+                and insn_size < min_hook_instruction_bytes
+            ):
+                return False
+            return True
+
+        first_addr = insns[0]["address"]
+
+        if first_addr < image_base:
+            logger.warning(
+                "Skipping symbol {} entry hook: address 0x{:x} below image base 0x{:x}",
+                symbol,
+                first_addr,
+                image_base,
+            )
+        elif not _is_hookable_addr(first_addr):
+            logger.warning(
+                "Skipping symbol {} entry hook: unhookable entry instruction {} at 0x{:x}",
+                symbol,
+                insn_by_addr[first_addr]["mnemonic"],
+                first_addr,
+            )
+        else:
+            hook_specs.append(
+                {
+                    "id": next_function_id,
+                    "channel": "function",
+                    "symbol": symbol,
+                    "func_token": symbol,
+                    "source_address": f"0x{first_addr:x}",
+                    "offset": f"0x{first_addr - image_base:x}",
+                }
+            )
+            next_function_id += 1
+
+        branch_addrs: set[int] = set()
+        bb_leaders: set[int] = {first_addr}
+
+        for idx, insn in enumerate(insns):
+            mnemonic = insn["mnemonic"]
+            if not _is_branch_mnemonic(mnemonic):
+                continue
+
+            cur_addr = insn["address"]
+            branch_addrs.add(cur_addr)
+
+            target_addr = _extract_direct_target_address(insn["operand"])
+            if target_addr is not None and target_addr in addr_set:
+                bb_leaders.add(target_addr)
+
+            if _is_conditional_branch_mnemonic(mnemonic) and idx + 1 < len(insns):
+                bb_leaders.add(insns[idx + 1]["address"])
+
+        for addr in sorted(bb_leaders):
+            if addr < image_base:
+                continue
+            if not _is_hookable_addr(addr):
+                continue
+            hook_specs.append(
+                {
+                    "id": next_bb_id,
+                    "channel": "bb",
+                    "symbol": symbol,
+                    "func_token": f"{symbol}__bb",
+                    "source_address": f"0x{addr:x}",
+                    "offset": f"0x{addr - image_base:x}",
+                }
+            )
+            next_bb_id += 1
+
+        for addr in sorted(branch_addrs):
+            if addr < image_base:
+                continue
+            if not _is_hookable_addr(addr):
+                continue
+            hook_specs.append(
+                {
+                    "id": next_branch_id,
+                    "channel": "branch",
+                    "symbol": symbol,
+                    "func_token": f"{symbol}__br",
+                    "source_address": f"0x{addr:x}",
+                    "offset": f"0x{addr - image_base:x}",
+                }
+            )
+            next_branch_id += 1
+
+    expected_event_space = {
+        "function": sum(1 for s in hook_specs if s["channel"] == "function"),
+        "bb": sum(1 for s in hook_specs if s["channel"] == "bb"),
+        "branch": sum(1 for s in hook_specs if s["channel"] == "branch"),
+    }
+    expected_event_space["total"] = (
+        expected_event_space["function"]
+        + expected_event_space["bb"]
+        + expected_event_space["branch"]
+    )
+
+    return hook_specs, expected_event_space, image_base
+
+
+def _generate_frida_static_offset_script_content(
+    module_name: str,
+    hook_specs: list[dict[str, Any]],
 ) -> str:
-    hooks = [{"id": idx, "name": sym} for idx, sym in enumerate(symbols, start=1)]
-    hooks_json = json.dumps(hooks, indent=2)
+    hooks_json = json.dumps(hook_specs, indent=2)
     target_module_json = json.dumps(module_name)
     trace_tag_json = json.dumps(module_name)
 
-    return f"""// Auto-generated by ConcoLLMic `instrument` (Frida mode)
+    return f"""// Auto-generated by ConcoLLMic `instrument` (Frida static-offset mode)
 'use strict';
 
 const TARGET_MODULE = {target_module_json};
 const TRACE_TAG = {trace_tag_json};
 const HOOK_SPECS = {hooks_json};
 
-function resolveAddress(spec) {{
-  let addr = null;
-  try {{
-    addr = Module.findExportByName(TARGET_MODULE, spec.name);
-  }} catch (_e) {{}}
-  if (addr) return addr;
+const targetModule = Process.findModuleByName(TARGET_MODULE);
+if (!targetModule) {{
+  throw new Error(`[frida-static] target module not found: ${{TARGET_MODULE}}`);
+}}
 
-  try {{
-    const matches = DebugSymbol.findFunctionsNamed(spec.name);
-    if (matches && matches.length > 0) {{
-      return matches[0];
-    }}
-  }} catch (_e) {{}}
-  return null;
+let writePtr = null;
+if (typeof Module.findGlobalExportByName === 'function') {{
+  writePtr = Module.findGlobalExportByName('write');
+}}
+if (!writePtr && typeof Module.findExportByName === 'function') {{
+  writePtr = Module.findExportByName(null, 'write');
+}}
+if (!writePtr && typeof DebugSymbol === 'function' && typeof DebugSymbol.fromName === 'function') {{
+  const sym = DebugSymbol.fromName('write');
+  if (sym && sym.address) {{
+    writePtr = sym.address;
+  }}
+}}
+const writeSync =
+  writePtr && typeof writePtr.isNull === 'function' && !writePtr.isNull()
+    ? new NativeFunction(writePtr, 'int', ['int', 'pointer', 'ulong'])
+    : null;
+
+function resolveAddress(spec) {{
+  const offset = parseInt(spec.offset, 16);
+  if (!Number.isFinite(offset) || offset < 0) {{
+    return null;
+  }}
+  if (offset >= targetModule.size) {{
+    return null;
+  }}
+  return targetModule.base.add(offset);
 }}
 
 function emitTrace(action, spec) {{
   // Format aligned with ConcoLLMic FILE_TRACE_PATTERN:
   // [file] enter|exit function_name block_id
-  console.log(`[${{TRACE_TAG}}] ${{action}} ${{spec.name}} ${{spec.id}}`);
+  const line = `[${{TRACE_TAG}}] ${{action}} ${{spec.func_token}} ${{spec.id}}\\n`;
+  if (writeSync) {{
+    try {{
+      const buf = Memory.allocUtf8String(line);
+      writeSync(2, buf, line.length);
+      return;
+    }} catch (_e) {{
+      // fall through to async logging below
+    }}
+  }}
+  console.log(line.trim());
 }}
 
 let attached = 0;
@@ -168,265 +673,19 @@ for (const spec of HOOK_SPECS) {{
         emitTrace('enter', spec);
       }},
       onLeave(_retval) {{
-        emitTrace('exit', spec);
-      }},
-    }});
-    attached += 1;
-  }} catch (e) {{
-    console.error(`[frida-hook] failed: ${{spec.name}} (${{e}})`);
-  }}
-}}
-
-console.error(
-  `[frida-hook] attached ${{attached}}/${{HOOK_SPECS.length}} hooks on module ${{TARGET_MODULE}}`
-);
-"""
-
-
-def _generate_frida_stalker_script_content(
-    module_name: str,
-    symbols: list[str],
-    emit_function: bool = True,
-    emit_bb: bool = True,
-    emit_branch: bool = True,
-) -> str:
-    hooks = [{"id": idx, "name": sym} for idx, sym in enumerate(symbols, start=1)]
-    hooks_json = json.dumps(hooks, indent=2)
-    target_module_json = json.dumps(module_name)
-    trace_tag_json = json.dumps(module_name)
-
-    emit_function_js = str(emit_function).lower()
-    emit_bb_js = str(emit_bb).lower()
-    emit_branch_js = str(emit_branch).lower()
-
-    return f"""// Auto-generated by ConcoLLMic `instrument` (Frida stalker mode)
-'use strict';
-
-const TARGET_MODULE = {target_module_json};
-const TRACE_TAG = {trace_tag_json};
-const HOOK_SPECS = {hooks_json};
-const EMIT_FUNCTION = {emit_function_js};
-const EMIT_BB = {emit_bb_js};
-const EMIT_BRANCH = {emit_branch_js};
-
-// Distinct channels encoded through function-name suffixes so downstream can separate:
-//   <func>      => function enter/exit
-//   <func>__bb  => basic block hit
-//   <func>__br  => branch-instruction hit
-const FUNCTION_SUFFIX = '';
-const BB_SUFFIX = '__bb';
-const BR_SUFFIX = '__br';
-
-const bbIdByKey = new Map();
-const brIdByKey = new Map();
-const threadState = new Map();
-
-const targetModule = Process.findModuleByName(TARGET_MODULE);
-if (!targetModule) {{
-  console.error(`[frida-stalker] warning: target module not found by name "${{TARGET_MODULE}}", address filtering disabled`);
-}}
-const symbolSizeByName = new Map();
-if (targetModule) {{
-  try {{
-    const runtimeSymbols = Module.enumerateSymbolsSync(TARGET_MODULE);
-    for (const s of runtimeSymbols) {{
-      if (!s || !s.name || s.type !== 'function') continue;
-      if (typeof s.size === 'number' && s.size > 0 && !symbolSizeByName.has(s.name)) {{
-        symbolSizeByName.set(s.name, s.size);
-      }}
-    }}
-  }} catch (_e) {{}}
-}}
-
-function isInTargetModule(addr) {{
-  if (!targetModule) return true;
-  const start = targetModule.base;
-  const end = targetModule.base.add(targetModule.size);
-  return addr.compare(start) >= 0 && addr.compare(end) < 0;
-}}
-
-function resolveSymbolSize(specName) {{
-  if (symbolSizeByName.has(specName)) {{
-    return symbolSizeByName.get(specName);
-  }}
-  try {{
-    const ds = DebugSymbol.fromName(specName);
-    if (ds && typeof ds.size === 'number' && ds.size > 0) {{
-      return ds.size;
-    }}
-  }} catch (_e) {{}}
-  return 0;
-}}
-
-function resolveAddress(spec) {{
-  let addr = null;
-  try {{
-    addr = Module.findExportByName(TARGET_MODULE, spec.name);
-  }} catch (_e) {{}}
-  if (addr) return addr;
-
-  try {{
-    const matches = DebugSymbol.findFunctionsNamed(spec.name);
-    if (matches && matches.length > 0) {{
-      return matches[0];
-    }}
-  }} catch (_e) {{}}
-  return null;
-}}
-
-function isBranchMnemonic(mnemonic) {{
-  const m = mnemonic.toLowerCase();
-  return (
-    m.startsWith('j') ||        // x86 jcc/jmp
-    m === 'b' ||                // arm/arm64 unconditional branch
-    m.startsWith('b.') ||       // arm64 conditional branch (b.eq etc.)
-    m.startsWith('cb') ||       // cbz/cbnz
-    m.startsWith('tb') ||       // tbz/tbnz
-    m === 'br' ||
-    m === 'blr' ||
-    m === 'bx'
-  );
-}}
-
-function getOrCreateId(map, key, base) {{
-  if (!map.has(key)) {{
-    map.set(key, map.size + base);
-  }}
-  return map.get(key);
-}}
-
-function emitTrace(action, funcName, id) {{
-  // Format aligned with ConcoLLMic FILE_TRACE_PATTERN:
-  // [file] enter|exit function_name block_id
-  console.log(`[${{TRACE_TAG}}] ${{action}} ${{funcName}} ${{id}}`);
-}}
-
-function getThreadState(tid) {{
-  if (!threadState.has(tid)) {{
-    threadState.set(tid, {{ depth: 0, stalking: false, trackedStack: [] }});
-  }}
-  return threadState.get(tid);
-}}
-
-function isPcInsideTrackedFunc(pc, trackedFunc) {{
-  if (!trackedFunc) return false;
-  if (!trackedFunc.start || !trackedFunc.end) return true;
-  return pc.compare(trackedFunc.start) >= 0 && pc.compare(trackedFunc.end) < 0;
-}}
-
-function startStalkerForThread(tid) {{
-  Stalker.follow(tid, {{
-    transform(iterator) {{
-      let firstInBlock = true;
-      let instruction = iterator.next();
-      while (instruction !== null) {{
-        const insnAddress = instruction.address;
-        const insnMnemonic = instruction.mnemonic;
-        if (!isInTargetModule(insnAddress)) {{
-          iterator.keep();
-          instruction = iterator.next();
-          firstInBlock = true;
-          continue;
-        }}
-
-        if (EMIT_BB && firstInBlock) {{
-          iterator.putCallout(function (_context) {{
-            const tidInner = Process.getCurrentThreadId();
-            const state = getThreadState(tidInner);
-            if (!state.trackedStack || state.trackedStack.length === 0) return;
-            const trackedFunc = state.trackedStack[state.trackedStack.length - 1];
-            const targetFunc = trackedFunc.name;
-            const pc = _context.pc;
-            if (!isInTargetModule(pc)) return;
-            if (!isPcInsideTrackedFunc(pc, trackedFunc)) return;
-            const bbKey = `${{targetFunc}}@${{pc.toString()}}`;
-            const bbId = getOrCreateId(bbIdByKey, bbKey, 100000);
-            emitTrace('enter', `${{targetFunc}}${{BB_SUFFIX}}`, bbId);
-          }});
-          firstInBlock = false;
-        }}
-
-        if (EMIT_BRANCH && isBranchMnemonic(insnMnemonic)) {{
-          iterator.putCallout(function (_context) {{
-            const tidInner = Process.getCurrentThreadId();
-            const state = getThreadState(tidInner);
-            if (!state.trackedStack || state.trackedStack.length === 0) return;
-            const trackedFunc = state.trackedStack[state.trackedStack.length - 1];
-            const targetFunc = trackedFunc.name;
-            const pc = _context.pc;
-            if (!isInTargetModule(pc)) return;
-            if (!isPcInsideTrackedFunc(pc, trackedFunc)) return;
-            const brKey = `${{targetFunc}}@${{pc.toString()}}`;
-            const brId = getOrCreateId(brIdByKey, brKey, 200000);
-            emitTrace('enter', `${{targetFunc}}${{BR_SUFFIX}}`, brId);
-          }});
-        }}
-
-        iterator.keep();
-        instruction = iterator.next();
-      }}
-    }},
-  }});
-}}
-
-let attached = 0;
-for (const spec of HOOK_SPECS) {{
-  try {{
-    const addr = resolveAddress(spec);
-    if (!addr) {{
-      continue;
-    }}
-
-    Interceptor.attach(addr, {{
-      onEnter(_args) {{
-        const tid = Process.getCurrentThreadId();
-        const state = getThreadState(tid);
-        state.depth += 1;
-        const size = resolveSymbolSize(spec.name);
-        state.trackedStack.push({{
-          name: spec.name,
-          start: addr,
-          end: size > 0 ? addr.add(size) : null,
-        }});
-
-        if (EMIT_FUNCTION) {{
-          emitTrace('enter', `${{spec.name}}${{FUNCTION_SUFFIX}}`, spec.id);
-        }}
-
-        if (!state.stalking) {{
-          startStalkerForThread(tid);
-          state.stalking = true;
-        }}
-      }},
-      onLeave(_retval) {{
-        const tid = Process.getCurrentThreadId();
-        const state = getThreadState(tid);
-
-        if (EMIT_FUNCTION) {{
-          emitTrace('exit', `${{spec.name}}${{FUNCTION_SUFFIX}}`, spec.id);
-        }}
-
-        if (state.trackedStack && state.trackedStack.length > 0) {{
-          state.trackedStack.pop();
-        }}
-        if (state.depth > 0) {{
-          state.depth -= 1;
-        }}
-        if (state.depth === 0 && state.stalking) {{
-          Stalker.unfollow(tid);
-          Stalker.garbageCollect();
-          state.stalking = false;
+        if (spec.channel === 'function') {{
+          emitTrace('exit', spec);
         }}
       }},
     }});
     attached += 1;
   }} catch (e) {{
-    console.error(`[frida-stalker] failed: ${{spec.name}} (${{e}})`);
+    console.error(`[frida-static] failed: ${{spec.func_token}} @ ${{spec.offset}} (${{e}})`);
   }}
 }}
 
 console.error(
-  `[frida-stalker] attached ${{attached}}/${{HOOK_SPECS.length}} function hooks on module ${{TARGET_MODULE}}`
+  `[frida-static] attached ${{attached}}/${{HOOK_SPECS.length}} static hooks on module ${{TARGET_MODULE}}`
 );
 """
 
@@ -439,12 +698,16 @@ def generate_frida_hook_script(
     include_regex: str | None = None,
     exclude_regex: str | None = None,
     target_functions: list[str] | None = None,
-    mode: str = "function",
-) -> tuple[str, int]:
+    mode: str = "static_offset",
+) -> tuple[str, int, list[str], str, dict[str, Any], list[dict[str, Any]], int]:
     if not os.path.exists(binary_path):
         raise FileNotFoundError(f"Binary not found: {binary_path}")
     if max_hooks <= 0:
         raise ValueError("max_hooks must be positive")
+    if mode != "static_offset":
+        raise ValueError(
+            f"Unsupported frida mode: {mode}. Only 'static_offset' is supported."
+        )
 
     symbols = _extract_function_symbols(binary_path)
 
@@ -472,30 +735,21 @@ def generate_frida_hook_script(
             "Try removing include/exclude regex or increasing symbol visibility."
         )
 
-    if mode not in ("function", "stalker", "stalker_branch"):
-        raise ValueError(f"Unsupported frida mode: {mode}")
+    hook_specs, expected_event_space, image_base = _compute_static_offset_hook_specs(
+        binary_path,
+        filtered,
+    )
+    if not hook_specs:
+        raise RuntimeError(
+            "Failed to produce static hook specs from target symbols. "
+            "Ensure objdump/readelf are available and symbols are disassemblable."
+        )
 
     target_module_name = module_name or os.path.basename(binary_path)
-    if mode == "stalker":
-        content = _generate_frida_stalker_script_content(
-            target_module_name,
-            filtered,
-            emit_function=True,
-            emit_bb=True,
-            emit_branch=True,
-        )
-    elif mode == "stalker_branch":
-        content = _generate_frida_stalker_script_content(
-            target_module_name,
-            filtered,
-            emit_function=False,
-            emit_bb=False,
-            emit_branch=True,
-        )
-    else:
-        content = _generate_frida_function_hook_script_content(
-            target_module_name, filtered
-        )
+    content = _generate_frida_static_offset_script_content(
+        target_module_name,
+        hook_specs,
+    )
 
     script_dir = os.path.dirname(script_out)
     if script_dir:
@@ -505,18 +759,36 @@ def generate_frida_hook_script(
 
     symbols_out = script_out + ".symbols.txt"
     with open(symbols_out, "w", encoding="utf-8") as f:
-        for idx, sym in enumerate(filtered, start=1):
-            f.write(f"{idx}\t{sym}\n")
+        f.write("# id\tchannel\tfunc_token\tsymbol\toffset\tsource_address\n")
+        for spec in hook_specs:
+            f.write(
+                f"{spec['id']}\t{spec['channel']}\t{spec['func_token']}\t{spec['symbol']}\t{spec['offset']}\t{spec['source_address']}\n"
+            )
 
     logger.info(
-        "Frida {} script generated at {} with {} symbols (binary: {})",
-        mode,
+        "Frida static-offset script generated at {} with {} hooks over {} symbols (binary: {})",
         script_out,
+        len(hook_specs),
         len(filtered),
         binary_path,
     )
+    logger.info(
+        "Expected static event space: function={}, bb={}, branch={}, total={}",
+        expected_event_space["function"],
+        expected_event_space["bb"],
+        expected_event_space["branch"],
+        expected_event_space["total"],
+    )
     logger.info("Frida symbol map saved at {}", symbols_out)
-    return script_out, len(filtered)
+    return (
+        script_out,
+        len(hook_specs),
+        filtered,
+        target_module_name,
+        expected_event_space,
+        hook_specs,
+        image_base,
+    )
 
 
 class TaskExecutor:
@@ -1123,7 +1395,7 @@ def instrument_code(
     frida_include_regex: str | None = None,
     frida_exclude_regex: str | None = None,
     frida_target_functions: str | None = None,
-    frida_mode: str = "function",
+    frida_mode: str = "static_offset",
 ):
     """
     Code instrumentation phase
@@ -1139,23 +1411,32 @@ def instrument_code(
         frida_script_out: Optional output path for generated Frida script
         frida_module: Optional module name used by Frida script at runtime
         frida_only: If True, generate Frida artifacts only (skip source instrumentation)
-        frida_max_hooks: Max number of function hooks to generate
+        frida_max_hooks: Max number of target symbols to include in hook generation
         frida_include_regex: Optional regex to include symbol names
         frida_exclude_regex: Optional regex to exclude symbol names
         frida_target_functions: Optional comma-separated exact function symbol names
-        frida_mode: "function", "stalker", or "stalker_branch"
+        frida_mode: "static_offset"
     """
     logger.info("Starting code instrumentation phase...")
 
     # Create output directory if it doesn't exist
     os.makedirs(out_dir, exist_ok=True)
+    frida_artifacts: dict[str, Any] | None = None
 
     if frida_binary:
         frida_script_path = frida_script_out or os.path.join(out_dir, "frida_hooks.js")
         target_functions = None
         if frida_target_functions:
             target_functions = [f.strip() for f in frida_target_functions.split(",")]
-        generate_frida_hook_script(
+        (
+            generated_script_path,
+            generated_symbol_count,
+            generated_symbols,
+            generated_module_name,
+            generated_expected_event_space,
+            generated_hook_specs,
+            generated_image_base,
+        ) = generate_frida_hook_script(
             binary_path=frida_binary,
             script_out=frida_script_path,
             module_name=frida_module,
@@ -1165,11 +1446,36 @@ def instrument_code(
             target_functions=target_functions,
             mode=frida_mode,
         )
-        logger.info("Frida script ready: {}", frida_script_path)
+        frida_artifacts = {
+            "binary_path": frida_binary,
+            "script_path": generated_script_path,
+            "symbol_count": generated_symbol_count,
+            "symbols": generated_symbols,
+            "module_name": generated_module_name,
+            "mode": frida_mode,
+            "expected_event_space": generated_expected_event_space,
+            "hook_specs": generated_hook_specs,
+            "image_base": generated_image_base,
+        }
+        logger.info("Frida script ready: {}", generated_script_path)
 
     if frida_only:
         if not frida_binary:
             raise ValueError("--frida_only requires --frida_binary")
+        if frida_artifacts:
+            trace_map = _build_frida_trace_map(
+                binary_path=frida_artifacts["binary_path"],
+                module_name=frida_artifacts["module_name"],
+                frida_mode=frida_artifacts["mode"],
+                symbols=frida_artifacts["symbols"],
+                project_dir=None,
+                expected_event_space=frida_artifacts.get("expected_event_space"),
+                hook_specs=frida_artifacts.get("hook_specs"),
+                image_base=frida_artifacts.get("image_base"),
+            )
+            trace_map_path = os.path.join(out_dir, FRIDA_TRACE_MAP_FILE)
+            _save_frida_trace_map(trace_map, trace_map_path)
+            logger.info("Frida trace map saved at {}", trace_map_path)
         logger.info(
             "Frida-only mode enabled. Source instrumentation skipped successfully."
         )
@@ -1453,6 +1759,22 @@ def instrument_code(
     with open(info_file_path, "w", encoding="utf-8") as f:
         f.write(content)
     logger.info(f"Detailed instrumentation info saved to {info_file_path}")
+
+    if frida_artifacts:
+        trace_map = _build_frida_trace_map(
+            binary_path=frida_artifacts["binary_path"],
+            module_name=frida_artifacts["module_name"],
+            frida_mode=frida_artifacts["mode"],
+            symbols=frida_artifacts["symbols"],
+            project_dir=out_dir,
+            expected_event_space=frida_artifacts.get("expected_event_space"),
+            hook_specs=frida_artifacts.get("hook_specs"),
+            image_base=frida_artifacts.get("image_base"),
+        )
+        trace_map_path = os.path.join(out_dir, FRIDA_TRACE_MAP_FILE)
+        _save_frida_trace_map(trace_map, trace_map_path)
+        logger.info("Frida trace map saved at {}", trace_map_path)
+
     logger.info("=" * 50)
 
 
@@ -1528,7 +1850,7 @@ def setup_instrument_parser(subparsers):
     instrument_parser.add_argument(
         "--frida_max_hooks",
         type=int,
-        help="maximum number of symbol hooks to include in generated Frida script",
+        help="maximum number of target symbols to include when generating static Frida hooks",
         required=False,
         default=500,
     )
@@ -1556,9 +1878,9 @@ def setup_instrument_parser(subparsers):
     instrument_parser.add_argument(
         "--frida_mode",
         type=str,
-        choices=["function", "stalker", "stalker_branch"],
-        help="Frida generation mode: function hooks, stalker(all events), or stalker_branch(only branch events)",
+        choices=["static_offset"],
+        help="Frida generation mode: static_offset (deterministic function/basic-block/branch offset hooks)",
         required=False,
-        default="function",
+        default="static_offset",
     )
     return instrument_parser

@@ -3,7 +3,9 @@ Concolic execution command for ACE.
 """
 
 import atexit
+import ast
 import concurrent.futures
+import json
 import os
 import random
 import re
@@ -41,6 +43,419 @@ from app.utils.utils import (
 )
 
 
+def _format_trace_event(event: tuple[str, str, int]) -> str:
+    file_path, func_name, block_id = event
+    return f"[{file_path}] enter {func_name} {block_id}"
+
+
+def _extract_enter_trace_events(trace_str: str) -> list[tuple[str, str, int]]:
+    """Extract exact enter-events from trace lines."""
+    if not trace_str:
+        return []
+
+    events: list[tuple[str, str, int]] = []
+    for line in trace_str.strip().split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        match = re.fullmatch(FILE_TRACE_PATTERN, stripped)
+        if match is None:
+            continue
+
+        file_path, action, func_name, block_id = match.groups()
+        if action != "enter":
+            continue
+        events.append((os.path.normpath(file_path), func_name, int(block_id)))
+    return events
+
+
+def _dedup_preserve_order(
+    events: list[tuple[str, str, int]],
+) -> list[tuple[str, str, int]]:
+    seen = set()
+    result = []
+    for event in events:
+        if event in seen:
+            continue
+        seen.add(event)
+        result.append(event)
+    return result
+
+
+def _classify_event_channel(func_name: str, block_id: int) -> str:
+    """Classify event channel from function suffix / id range."""
+    if func_name.endswith("__br") or block_id >= 200000:
+        return "branch"
+    if func_name.endswith("__bb") or block_id >= 100000:
+        return "bb"
+    return "function"
+
+
+class BinaryTraceCoverage:
+    """Coverage tracker for source-independent (binary-only) trace events."""
+
+    def __init__(self):
+        self.event2cov: dict[tuple[str, str, int], int] = {}
+
+    def collect_trace(
+        self,
+        trace_str: str,
+        add_coverage: bool = True,
+    ) -> tuple[int, str]:
+        events = _dedup_preserve_order(_extract_enter_trace_events(trace_str))
+        new_events: list[tuple[str, str, int]] = []
+
+        if add_coverage:
+            for event in events:
+                prev_cov = self.event2cov.get(event, 0)
+                self.event2cov[event] = prev_cov + 1
+                if prev_cov == 0:
+                    new_events.append(event)
+
+        lines = [
+            "Binary-only trace summary",
+            f"- Enter events in this execution: {len(events)}",
+            f"- Newly discovered events: {len(new_events)}",
+            f"- Total discovered events: {len(self.event2cov)}",
+        ]
+
+        if events:
+            lines.append("- Observed events (first 120):")
+            for event in events[:120]:
+                lines.append(f"  {_format_trace_event(event)}")
+        else:
+            lines.append("- Observed events: (none)")
+
+        return len(new_events), "\n".join(lines)
+
+    def get_seen_events(self) -> list[tuple[str, str, int]]:
+        return sorted(self.event2cov.keys())
+
+    def get_discovered_counts_by_channel(self) -> dict[str, int]:
+        counts = {"function": 0, "bb": 0, "branch": 0, "total": 0}
+        for _, func_name, block_id in self.event2cov.keys():
+            channel = _classify_event_channel(func_name, block_id)
+            counts[channel] += 1
+        counts["total"] = counts["function"] + counts["bb"] + counts["branch"]
+        return counts
+
+
+def _load_binary_expected_event_space() -> dict[str, int | str | list[str] | None]:
+    """Load expected event-space metadata for binary-only runs when available."""
+    expected: dict[str, int | str | list[str] | None] = {
+        "function": None,
+        "bb": None,
+        "branch": None,
+        "frida_mode": None,
+        "notes": [],
+    }
+
+    map_path = os.environ.get("FRIDA_TRACE_MAP_PATH")
+    if map_path and os.path.exists(map_path):
+        try:
+            with open(map_path, encoding="utf-8") as f:
+                trace_map = json.load(f)
+
+            frida_mode = trace_map.get("frida_mode")
+            if isinstance(frida_mode, str):
+                expected["frida_mode"] = frida_mode
+
+            expected_event_space = trace_map.get("expected_event_space")
+            if isinstance(expected_event_space, dict):
+                for channel in ("function", "bb", "branch"):
+                    value = expected_event_space.get(channel)
+                    if isinstance(value, int):
+                        expected[channel] = value
+                if any(isinstance(expected_event_space.get(k), int) for k in ("function", "bb", "branch")):
+                    expected["notes"].append(
+                        f"expected event space from trace map ({map_path})"
+                    )
+
+            symbols = trace_map.get("symbols")
+            if expected["function"] is None and isinstance(symbols, list):
+                expected["function"] = len({str(s) for s in symbols if str(s)})
+                expected["notes"].append(f"function expected from trace map symbols ({map_path})")
+            elif expected["function"] is None:
+                symbol_mappings = trace_map.get("symbol_mappings")
+                if isinstance(symbol_mappings, dict):
+                    expected["function"] = len(symbol_mappings)
+                    expected["notes"].append(
+                        f"function expected from symbol_mappings ({map_path})"
+                    )
+
+            # Fallback: derive branch expectation from mapped ACE block IDs.
+            if expected["branch"] is None:
+                symbol_mappings = trace_map.get("symbol_mappings", {})
+                if isinstance(symbol_mappings, dict):
+                    ace_branch_ids: set[int] = set()
+                    for info in symbol_mappings.values():
+                        if not isinstance(info, dict):
+                            continue
+                        block_ids = info.get("ace_block_ids")
+                        if not isinstance(block_ids, list):
+                            continue
+                        for block_id in block_ids:
+                            if isinstance(block_id, int):
+                                ace_branch_ids.add(block_id)
+                    if ace_branch_ids:
+                        expected["branch"] = len(ace_branch_ids)
+                        expected["notes"].append(
+                            f"branch expected from mapped ace_block_ids ({map_path})"
+                        )
+        except Exception as e:
+            logger.warning("Failed to load FRIDA_TRACE_MAP_PATH {}: {}", map_path, e)
+
+    # Fallback: parse HOOK_SPECS from generated script for channel-wise expected counts.
+    script_path = os.environ.get("FRIDA_SCRIPT_PATH")
+    if (
+        (expected["function"] is None or expected["bb"] is None or expected["branch"] is None)
+        and script_path
+        and os.path.exists(script_path)
+    ):
+        try:
+            script_text = open(script_path, encoding="utf-8").read()
+            hook_specs_match = re.search(
+                r"const\s+HOOK_SPECS\s*=\s*(\[[\s\S]*?\]);",
+                script_text,
+            )
+            if hook_specs_match:
+                hook_specs = json.loads(hook_specs_match.group(1))
+                if isinstance(hook_specs, list):
+                    channel_counts = {"function": 0, "bb": 0, "branch": 0}
+                    has_channel_field = False
+                    for spec in hook_specs:
+                        if not isinstance(spec, dict):
+                            continue
+                        channel = spec.get("channel")
+                        if channel in channel_counts:
+                            has_channel_field = True
+                            channel_counts[channel] += 1
+
+                    # Backward compatibility: older scripts had only function hooks
+                    # and no explicit "channel" field.
+                    if not has_channel_field:
+                        channel_counts["function"] = len(hook_specs)
+
+                    if expected["function"] is None:
+                        expected["function"] = channel_counts["function"] or None
+                    if expected["bb"] is None:
+                        expected["bb"] = channel_counts["bb"] or None
+                    if expected["branch"] is None:
+                        expected["branch"] = channel_counts["branch"] or None
+                    expected["notes"].append(
+                        f"channel expected counts from HOOK_SPECS ({script_path})"
+                    )
+        except Exception as e:
+            logger.warning("Failed to parse FRIDA_SCRIPT_PATH {}: {}", script_path, e)
+
+    return expected
+
+
+def _format_discovered_vs_expected(discovered: int, expected: int | None) -> str:
+    if expected is None:
+        return f"{discovered}/unknown"
+    if expected == 0:
+        return f"{discovered}/0"
+    return f"{discovered}/{expected} ({discovered / expected:.2%})"
+
+
+def _build_binary_event_space_summary(
+    binary_coverage: BinaryTraceCoverage,
+    expected_space: dict[str, int | str | list[str] | None] | None,
+) -> str:
+    discovered = binary_coverage.get_discovered_counts_by_channel()
+
+    expected_function = None
+    expected_bb = None
+    expected_branch = None
+    notes: list[str] = []
+    frida_mode = None
+    if expected_space:
+        expected_function = expected_space.get("function")
+        expected_bb = expected_space.get("bb")
+        expected_branch = expected_space.get("branch")
+        frida_mode = expected_space.get("frida_mode")
+        notes = [
+            str(note) for note in (expected_space.get("notes") or []) if str(note).strip()
+        ]
+
+    lines = [
+        "Binary-only event space coverage:",
+        f"- total discovered events: {discovered['total']}",
+        f"- function events (discovered/expected): {_format_discovered_vs_expected(discovered['function'], expected_function)}",
+        f"- basic-block events (discovered/expected): {_format_discovered_vs_expected(discovered['bb'], expected_bb)}",
+        f"- branch events (discovered/expected): {_format_discovered_vs_expected(discovered['branch'], expected_branch)}",
+    ]
+    if frida_mode:
+        lines.append(f"- frida mode: {frida_mode}")
+    if notes:
+        lines.append(f"- expected-space source: {'; '.join(notes)}")
+    else:
+        lines.append("- expected-space source: unavailable (dynamic/runtime-only mapping)")
+    return "\n".join(lines)
+
+
+def _shorten_for_display(value: str, max_len: int = 120) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3] + "..."
+
+
+def _expr_to_summary(node: ast.AST, constant_bindings: dict[str, object]) -> str:
+    if isinstance(node, ast.Constant):
+        return repr(node.value)
+    if isinstance(node, ast.Name):
+        if node.id in constant_bindings:
+            return f"{node.id}={repr(constant_bindings[node.id])}"
+        return node.id
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return node.__class__.__name__
+
+
+def _extract_testcase_input_summary(exec_code: str | None) -> str:
+    """Best-effort extraction of concrete program inputs from execute_program code."""
+    if not exec_code:
+        return "(no execute_program code)"
+
+    try:
+        tree = ast.parse(exec_code)
+    except SyntaxError:
+        return "(unable to parse execute_program code)"
+
+    execute_fn: ast.AST | None = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "execute_program":
+            execute_fn = node
+            break
+    if execute_fn is None:
+        execute_fn = tree
+
+    constant_bindings: dict[str, object] = {}
+    for node in ast.walk(execute_fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        if not isinstance(node.value, ast.Constant):
+            continue
+        value = node.value.value
+        if isinstance(value, (str, int, float, bool)):
+            constant_bindings[node.targets[0].id] = value
+
+    file_input_exprs: list[str] = []
+    argv_exprs: list[str] = []
+
+    for node in ast.walk(execute_fn):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "write" and node.args:
+            file_input_exprs.append(_expr_to_summary(node.args[0], constant_bindings))
+            continue
+
+        is_subprocess_run = (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+        )
+        if not is_subprocess_run:
+            continue
+        if not node.args:
+            continue
+        if not isinstance(node.args[0], (ast.List, ast.Tuple)):
+            continue
+
+        elements = list(node.args[0].elts)
+        literal_values = [
+            elt.value if isinstance(elt, ast.Constant) else None for elt in elements
+        ]
+
+        start_idx = None
+        for idx, literal in enumerate(literal_values):
+            if literal == "--":
+                start_idx = idx + 1
+                break
+
+        # In non-Frida harnesses there is no "--"; fall back to skipping argv[0].
+        if start_idx is None:
+            start_idx = 1 if len(elements) > 1 else len(elements)
+
+        for elt in elements[start_idx:]:
+            argv_exprs.append(_expr_to_summary(elt, constant_bindings))
+
+    parts: list[str] = []
+    if file_input_exprs:
+        shown = ", ".join(_shorten_for_display(v, 80) for v in file_input_exprs[:3])
+        parts.append(f"file_input={shown}")
+    if argv_exprs:
+        shown = ", ".join(_shorten_for_display(v, 80) for v in argv_exprs[:5])
+        parts.append(f"argv_input={shown}")
+
+    if not parts:
+        return "(input extraction unavailable)"
+    return " | ".join(parts)
+
+
+def _build_round_input_summary(testcases: list[TestCase]) -> str:
+    if not testcases:
+        return "Generated testcases input summary: (none)"
+
+    lines = ["Generated testcases input summary:"]
+    for tc in sorted(testcases, key=lambda t: t.id):
+        status = "target✓" if tc.is_target_covered else "target✗"
+        if tc.is_crash:
+            status += ", crash"
+        if tc.is_hang:
+            status += ", hang"
+        lines.append(
+            f"- TestCase #{tc.id} (src={tc.src_id}, {status}): {_extract_testcase_input_summary(tc.exec_code)}"
+        )
+    return "\n".join(lines)
+
+
+def _adapt_frida_trace_if_needed(trace_str: str) -> str:
+    """Best-effort adaptation from raw Frida trace lines to ACE trace format.
+
+    This handles cases where solver-generated execution code returns raw Frida
+    output (module/symbol trace lines) instead of already-adapted ACE lines.
+    """
+    if not trace_str:
+        return trace_str
+
+    # No trace-like lines to adapt.
+    if re.search(FILE_TRACE_PATTERN, trace_str) is None:
+        return trace_str
+
+    map_path = os.environ.get("FRIDA_TRACE_MAP_PATH")
+    if not map_path or not os.path.exists(map_path):
+        return trace_str
+
+    try:
+        from app.utils.frida_trace_adapter import (
+            adapt_frida_trace_to_ace,
+            load_frida_trace_map,
+        )
+
+        trace_map = load_frida_trace_map(map_path)
+        adapted_trace, stats = adapt_frida_trace_to_ace(trace_str, trace_map)
+        if adapted_trace.strip() and stats.get("mapped_lines", 0) > 0:
+            logger.debug(
+                "Adapted raw Frida trace using {} (mapped_lines={}, skipped_non_trace_lines={}, skipped_unknown_symbol={})",
+                map_path,
+                stats.get("mapped_lines", 0),
+                stats.get("skipped_non_trace_lines", 0),
+                stats.get("skipped_unknown_symbol", 0),
+            )
+            return adapted_trace
+    except Exception as e:
+        logger.warning("Failed to adapt raw Frida trace using {}: {}", map_path, e)
+
+    return trace_str
+
+
 def split_trace_by_file(trace_str: str) -> dict[str, str]:
     """Split execution trace by file name.
 
@@ -63,19 +478,17 @@ def split_trace_by_file(trace_str: str) -> dict[str, str]:
         if not line.strip():
             continue
 
-        matches = re.findall(FILE_TRACE_PATTERN, line.strip())
-        if len(matches) == 0:
+        # Require a strict single trace line to avoid parsing tool/runtime logs
+        # that may contain a trace-like substring (e.g., Frida REPL prefixes).
+        match = re.fullmatch(FILE_TRACE_PATTERN, line.strip())
+        if match is None:
             continue
 
-        for match in matches:
-            file_path, action, func_name, block_id = match
-            assert f"[{file_path}] {action} {func_name} {block_id}" in line
-            assert (
-                re.search(TRACE_PATTERN, f"{action} {func_name} {block_id}") is not None
-            )
-            file_traces[file_path].append(
-                f"[{file_path}] {action} {func_name} {block_id}"
-            )
+        file_path, action, func_name, block_id = match.groups()
+        assert (
+            re.search(TRACE_PATTERN, f"{action} {func_name} {block_id}") is not None
+        )
+        file_traces[file_path].append(f"[{file_path}] {action} {func_name} {block_id}")
 
     # Convert lists to strings
     return {
@@ -134,6 +547,8 @@ def _collect_trace_and_check_coverage(
     if execution_trace is None or execution_trace == "":
         return 0, False, ""
 
+    execution_trace = _adapt_frida_trace_if_needed(execution_trace)
+
     coverage = Coverage.get_instance()
     file_traces = split_trace_by_file(execution_trace)
     is_target_lines_covered = False if target_file_lines[0] is not None else True
@@ -168,6 +583,59 @@ def _collect_trace_and_check_coverage(
     return new_covered_lines, is_target_lines_covered, execution_summary
 
 
+def _collect_binary_trace_and_check_coverage(
+    execution_trace: str | None,
+    binary_coverage: BinaryTraceCoverage,
+    add_coverage: bool = True,
+) -> tuple[int, bool, str]:
+    """Collect trace for binary-only mode (no source file dependency)."""
+    if execution_trace is None or execution_trace == "":
+        return 0, False, ""
+
+    new_covered_events, execution_summary = binary_coverage.collect_trace(
+        execution_trace,
+        add_coverage=add_coverage,
+    )
+    # In binary-only mode, the round objective is to discover at least one NEW event.
+    is_target_covered = new_covered_events > 0 if add_coverage else True
+    return new_covered_events, is_target_covered, execution_summary
+
+
+def _build_binary_only_target(
+    src_testcase: TestCase,
+    binary_coverage: BinaryTraceCoverage,
+) -> tuple[str, str, tuple[None, tuple[None, None]], str]:
+    """Build a synthetic target/constraint for source-independent exploration."""
+    seen_events = binary_coverage.get_seen_events()
+    src_events = _dedup_preserve_order(_extract_enter_trace_events(src_testcase.execution_trace))
+
+    target_branch = "Discover at least one NEW runtime trace event (binary-only)"
+    justification = (
+        f"Binary-only mode objective: maximize unique runtime trace events. "
+        f"Discovered so far: {len(seen_events)}."
+    )
+
+    observed_lines = [_format_trace_event(event) for event in src_events[:80]]
+    observed_block = "\n".join(f"- {line}" for line in observed_lines) or "- (none)"
+    historical_lines = [_format_trace_event(event) for event in seen_events[:120]]
+    historical_block = "\n".join(f"- {line}" for line in historical_lines) or "- (none)"
+
+    target_path_constraint = (
+        "Goal: Generate NEW concrete inputs for the existing harness so execution reveals at least one NEW "
+        "runtime trace event not observed before.\n"
+        "Requirements:\n"
+        "1. Keep the harness structure and target binary invocation unchanged.\n"
+        "2. Only modify external inputs (arguments, temp file content, environment variables) used by the harness.\n"
+        "3. Aim to hit code paths that produce new `[file] enter function block_id` events.\n\n"
+        "Observed events in source execution (sample):\n"
+        f"{observed_block}\n\n"
+        "Historically discovered events (sample):\n"
+        f"{historical_block}\n"
+    )
+
+    return target_branch, justification, (None, (None, None)), target_path_constraint
+
+
 class TestCaseSelection(Enum):
     LLM = "llm"
     RANDOM = "random"
@@ -179,6 +647,8 @@ def solve_and_execute(
     summarize_msg_thread: MessageThread,
     exec_timeout: int,
     disable_review: bool = True,
+    binary_only: bool = False,
+    binary_trace_coverage: BinaryTraceCoverage | None = None,
 ):
     # process single test case, including solve and execute
     try:
@@ -336,27 +806,46 @@ def solve_and_execute(
                     )
 
                 # Process execution trace and check coverage
-                assert tc.target_file_lines[0] is not None
-                (
-                    tc.newly_covered_lines,
-                    tc.is_target_covered,
-                    tc.execution_summary,
-                ) = _collect_trace_and_check_coverage(
-                    tc.execution_trace,
-                    tc.target_file_lines,
-                )
-                tc.new_coverage = True if tc.newly_covered_lines > 0 else False
+                if binary_only:
+                    assert binary_trace_coverage is not None
+                    (
+                        tc.newly_covered_lines,
+                        tc.is_target_covered,
+                        tc.execution_summary,
+                    ) = _collect_binary_trace_and_check_coverage(
+                        tc.execution_trace,
+                        binary_trace_coverage,
+                    )
+                    tc.new_coverage = True if tc.newly_covered_lines > 0 else False
+                    logger.info(
+                        "TestCase #{} (binary-only): New runtime events: {}. Objective reached: {}",
+                        tc.id,
+                        tc.newly_covered_lines,
+                        tc.is_target_covered,
+                    )
+                else:
+                    assert tc.target_file_lines[0] is not None
+                    (
+                        tc.newly_covered_lines,
+                        tc.is_target_covered,
+                        tc.execution_summary,
+                    ) = _collect_trace_and_check_coverage(
+                        tc.execution_trace,
+                        tc.target_file_lines,
+                    )
+                    tc.new_coverage = True if tc.newly_covered_lines > 0 else False
 
-                logger.info(
-                    "TestCase #{}: Target lines ({}) covered: {}. Newly covered code lines: {}",
-                    tc.id,
-                    tc.target_file_lines,
-                    tc.is_target_covered,
-                    tc.newly_covered_lines,
-                )
+                    logger.info(
+                        "TestCase #{}: Target lines ({}) covered: {}. Newly covered code lines: {}",
+                        tc.id,
+                        tc.target_file_lines,
+                        tc.is_target_covered,
+                        tc.newly_covered_lines,
+                    )
                 covered_icon = "[green]✓[/]" if tc.is_target_covered else "[red]✗[/]"
+                new_cov_label = "events" if binary_only else "lines"
                 print_step(
-                    f"TestCase #{tc.id}: Target covered {covered_icon}  |  New lines: {tc.newly_covered_lines}"
+                    f"TestCase #{tc.id}: Target covered {covered_icon}  |  New {new_cov_label}: {tc.newly_covered_lines}"
                 )
 
                 # Determine next state
@@ -489,6 +978,7 @@ def run_concolic_execution(
     resume_in=None,
     plateau_slot=None,
     parallel_num=5,
+    binary_only=False,
 ):
     """Run concolic execution phase using a state machine approach.
 
@@ -526,11 +1016,27 @@ def run_concolic_execution(
     )
     update_project_dir(project_dir)
 
+    if binary_only and test_selection == TestCaseSelection.LLM:
+        logger.warning(
+            "Binary-only mode does not use LLM test-case scheduling. Falling back to DFS selection."
+        )
+        test_selection = TestCaseSelection.DFS
+
+    if binary_only and parallel_num != 1:
+        logger.warning(
+            "Binary-only mode currently runs with shared in-memory event coverage. Forcing parallel_num=1."
+        )
+        parallel_num = 1
+
     # Initialize TestCaseManager
     crash_cnt = 0
     hang_cnt = 0
 
     testcase_manager: TestCaseManager = TestCaseManager(out_dir)
+    binary_trace_coverage = BinaryTraceCoverage() if binary_only else None
+    binary_expected_event_space = (
+        _load_binary_expected_event_space() if binary_only else None
+    )
 
     # Initialize task executor for concurrent processing
     task_executor = TaskExecutor(max_workers=parallel_num)
@@ -558,18 +1064,30 @@ def run_concolic_execution(
         # Collect initial execution trace
         execution_trace = result["target_stderr"]
 
-        new_covered_lines, is_target_lines_covered, execution_summary = (
-            _collect_trace_and_check_coverage(execution_trace, (None, (None, None)))
-        )
+        if binary_only:
+            assert binary_trace_coverage is not None
+            new_covered_lines, is_target_lines_covered, execution_summary = (
+                _collect_binary_trace_and_check_coverage(
+                    execution_trace,
+                    binary_trace_coverage,
+                )
+            )
+        else:
+            new_covered_lines, is_target_lines_covered, execution_summary = (
+                _collect_trace_and_check_coverage(execution_trace, (None, (None, None)))
+            )
 
         if new_covered_lines == 0:
             logger.error(
-                "Initial test case execution did not cover any new lines, please check"
+                "Initial test case execution did not cover any new events/lines, please check"
             )
             sys.exit(1)
 
         assert is_target_lines_covered
-        print_step(f"Initial test case: {new_covered_lines} lines covered")
+        if binary_only:
+            print_step(f"Initial test case: {new_covered_lines} runtime events covered")
+        else:
+            print_step(f"Initial test case: {new_covered_lines} lines covered")
         # Create initial test case
 
         testcase_manager.add_initial_testcase(
@@ -609,9 +1127,16 @@ def run_concolic_execution(
                     f"Test case #{id} not found, skipping coverage replay..."
                 )
             elif testcase.execution_trace is not None:
-                _collect_trace_and_check_coverage(
-                    testcase.execution_trace, (None, (None, None))
-                )
+                if binary_only:
+                    assert binary_trace_coverage is not None
+                    _collect_binary_trace_and_check_coverage(
+                        testcase.execution_trace,
+                        binary_trace_coverage,
+                    )
+                else:
+                    _collect_trace_and_check_coverage(
+                        testcase.execution_trace, (None, (None, None))
+                    )
 
         time_bias = testcase_manager.get_max_time_taken()
         crash_cnt, hang_cnt = testcase_manager.get_crash_and_hang_count()
@@ -713,11 +1238,19 @@ def run_concolic_execution(
                 print_step(f"Using test case #{src_testcase.id} as the base test case")
 
                 # Refresh execution summary but DO NOT update the original execution summary of the testcase (used as backup)
-                _, _, latest_src_exec_summary = _collect_trace_and_check_coverage(
-                    src_testcase.execution_trace,
-                    (None, (None, None)),
-                    add_coverage=False,
-                )
+                if binary_only:
+                    assert binary_trace_coverage is not None
+                    _, _, latest_src_exec_summary = _collect_binary_trace_and_check_coverage(
+                        src_testcase.execution_trace,
+                        binary_trace_coverage,
+                        add_coverage=False,
+                    )
+                else:
+                    _, _, latest_src_exec_summary = _collect_trace_and_check_coverage(
+                        src_testcase.execution_trace,
+                        (None, (None, None)),
+                        add_coverage=False,
+                    )
 
                 # state transition
                 cur_ce_state = ConcolicExecutionState.SUMMARIZE
@@ -725,6 +1258,66 @@ def run_concolic_execution(
                 # summarize the test case
                 print_phase("SUMMARIZE")
                 branches_yielded_cnt = 0
+
+                if binary_only:
+                    assert binary_trace_coverage is not None
+                    (
+                        target_branch,
+                        justification,
+                        target_file_lines,
+                        target_path_constraint,
+                    ) = _build_binary_only_target(src_testcase, binary_trace_coverage)
+
+                    logger.info(
+                        "Processing binary-only objective for testcase #{}: {}",
+                        src_testcase.id,
+                        target_branch,
+                    )
+
+                    new_testcase: TestCase = testcase_manager.create_new_testcase(
+                        src_testcase.id,
+                        latest_src_exec_summary,
+                        target_branch,
+                        justification,
+                        target_file_lines,
+                        None,
+                        target_path_constraint,
+                    )
+
+                    # assign selection usage to the first generated testcase in this round
+                    new_testcase.add_usage(
+                        usage=selection_usage_details,
+                        state=TestcaseState.SELECT,
+                    )
+                    branches_yielded_cnt = 1
+                    new_testcase.save_to_disk()
+
+                    under_gen_tc_msg_thread[new_testcase.id] = MessageThread()
+                    under_gen_tcs.append(new_testcase)
+
+                    task_executor.submit_task(
+                        solve_and_execute,
+                        under_gen_tcs[-1],
+                        {
+                            "summarize_msg_thread": under_gen_tc_msg_thread[
+                                under_gen_tcs[-1].id
+                            ],
+                            "exec_timeout": timeout,
+                            "disable_review": True,
+                            "binary_only": True,
+                            "binary_trace_coverage": binary_trace_coverage,
+                        },
+                    )
+                    logger.info(
+                        "Submitted binary-only testcase #{} for solving and executing",
+                        new_testcase.id,
+                    )
+                    print_step(
+                        f"Submitted test case #{new_testcase.id} → solve & execute"
+                    )
+
+                    cur_ce_state = ConcolicExecutionState.SOLVE_AND_EXECUTE
+                    continue
 
                 func_call_chain_list = [
                     (file, func)
@@ -844,6 +1437,8 @@ def run_concolic_execution(
                             ],
                             "exec_timeout": timeout,
                             "disable_review": True,
+                            "binary_only": False,
+                            "binary_trace_coverage": None,
                         },
                     )
 
@@ -896,16 +1491,29 @@ def run_concolic_execution(
                 crash_cnt += sum(1 for tc in under_gen_tcs if tc.is_crash)
                 hang_cnt += sum(1 for tc in under_gen_tcs if tc.is_hang)
 
-                under_gen_tc_msg_thread.clear()
-                under_gen_tcs.clear()
-
                 stats_msg = testcase_manager.get_statistics()[1]
                 logger.info(
                     f"{stats_msg}\nCrash count: {crash_cnt}, hang count: {hang_cnt}"
                 )
                 print_step(stats_msg)
+
+                if binary_only and binary_trace_coverage is not None:
+                    event_space_msg = _build_binary_event_space_summary(
+                        binary_trace_coverage,
+                        binary_expected_event_space,
+                    )
+                    logger.info(event_space_msg)
+                    print_step(event_space_msg)
+
+                    input_summary_msg = _build_round_input_summary(under_gen_tcs)
+                    logger.info(input_summary_msg)
+                    print_step(input_summary_msg)
+
                 if crash_cnt > 0 or hang_cnt > 0:
                     print_step(f"Crashes: {crash_cnt}, Hangs: {hang_cnt}")
+
+                under_gen_tc_msg_thread.clear()
+                under_gen_tcs.clear()
 
                 # state transition
                 cur_ce_state = ConcolicExecutionState.SELECT
@@ -986,5 +1594,10 @@ def setup_run_parser(parser):
         help="number of parallel testcase generation",
         required=False,
         default=5,
+    )
+    run_parser.add_argument(
+        "--binary_only",
+        action="store_true",
+        help="enable source-independent binary-only mode (uses runtime trace-event coverage as objective)",
     )
     return run_parser

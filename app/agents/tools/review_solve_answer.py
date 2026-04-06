@@ -7,6 +7,8 @@ from loguru import logger
 
 from app.utils.utils import run_target
 
+VALIDATION_TIMEOUT_SECONDS = 10
+
 _SOLUTION_DESCRIPTION = """Use this tool to provide your REVIEW ANSWER to the previous solution.
 
 Your review should:
@@ -86,7 +88,7 @@ def process_review_solve_answer(
 
         # Verify if the Python execution runs successfully using run_target
         result = run_target(
-            new_python_execution, timeout=2
+            new_python_execution, timeout=VALIDATION_TIMEOUT_SECONDS
         )  # we don't need to wait for the program to finish, just check if the Python execution is successful
         if not result["exec_success"]:
             assert result["exec_error"] is not None

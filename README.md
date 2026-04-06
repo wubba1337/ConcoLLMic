@@ -64,8 +64,12 @@ The number of representable FP values in the range must be ≤ 20.
 ### Prerequisites
 
 - Python 3.10 or higher
-- API key for Claude Sonnet (from Anthropic)
-- For binary-only Frida instrumentation: `readelf` (from `binutils`)
+- API key for your selected LLM provider
+  - Default model in this repo is `gpt-4o-2024-11-20` (OpenAI)
+  - Anthropic keys are only needed if you switch to a Claude model
+- For binary-only Frida instrumentation:
+  - `readelf`/`objdump` (from `binutils`)
+  - `frida` CLI (`frida-tools`)
 
 ### Installation
 
@@ -85,14 +89,17 @@ sudo apt-get install -y binutils
 ```bash
 pip install -r requirements.txt
 pip install -r requirements-dev.txt # optional
+pip install frida-tools # needed for binary-only Frida flow
 ```
 
 4. **Set up your API key**
 ```bash
-export ANTHROPIC_API_KEY="your_api_key_here"
+export OPENAI_API_KEY="your_api_key_here"
+# Optional (only if you switch to Claude models):
+# export ANTHROPIC_API_KEY="your_api_key_here"
 ```
 
-By default, ConcoLLMic uses Claude 4.5 Sonnet. You can configure other models in [`ACE.py`](ACE.py) (see `setup_model()`).
+By default, ConcoLLMic uses `gpt-4o-2024-11-20`. You can configure other models in [`ACE.py`](ACE.py) (see `setup_model()`).
 For `instrument --frida_only`, no API key is required.
 
 ### Running Your First Example
@@ -151,6 +158,53 @@ python3 ACE.py run \
 - `--parallel_num`: Maximum number of concurrent test case generations per round
 
 > **Tip**: To observe the agent's step-by-step workflow more clearly (e.g., for demos or debugging), set `--parallel_num 1` so that each phase runs sequentially.
+
+**Step 2 (Alternative): Concolic Execution with Frida Traces (Binary-Only Objective)**
+
+You can also run Step 2 using Frida static-offset tracing while still feeding ACE-compatible trace lines to `ACE.py run`.
+
+1. Build an uninstrumented target binary:
+
+```bash
+mkdir -p ./code_example/bin
+g++ -O0 -g -fno-omit-frame-pointer \
+    -o ./code_example/bin/validate_brackets_plain \
+    ./code_example/src/validate_brackets.cpp
+```
+
+2. Generate Frida artifacts from the plain binary (script + symbols + `frida_trace_map.json`):
+
+```bash
+python3 ACE.py instrument \
+    --out_dir ./out/frida_validate_brackets_static \
+    --frida_binary ./code_example/bin/validate_brackets_plain \
+    --frida_only \
+    --frida_mode static_offset \
+    --frida_target_functions _Z17validate_bracketsPKc \
+    --frida_module validate_brackets_plain
+```
+
+3. Run concolic execution with the Frida adapter harness [`code_example/harness/validate_brackets_frida.py`](code_example/harness/validate_brackets_frida.py):
+
+```bash
+FRIDA_BIN="$HOME/.local/bin/frida" \
+FRIDA_TARGET_BINARY="$PWD/code_example/bin/validate_brackets_plain" \
+FRIDA_SCRIPT_PATH="$PWD/out/frida_validate_brackets_static/frida_hooks.js" \
+FRIDA_TRACE_MAP_PATH="$PWD/out/frida_validate_brackets_static/frida_trace_map.json" \
+FRIDA_TRACE_MODE=raw \
+FRIDA_CAPTURE_TIMEOUT=10 \
+FRIDA_MAX_RETRIES=5 \
+python3 ACE.py run \
+    --project_dir ./code_example/instr/ \
+    --execution ./code_example/harness/validate_brackets_frida.py \
+    --out ./out_frida_validate_brackets_static/ \
+    --rounds 2 \
+    --parallel_num 1 \
+    --timeout 120 \
+    --binary_only
+```
+
+The harness runs Frida, adapts Frida trace lines to ACE format (or uses raw ACE-style Frida lines), and returns the trace to `ACE.py run`.
 
 *Output*:
 - `./out/ConcoLLMic_*.log` — detailed execution log
@@ -240,11 +294,54 @@ python3 ACE.py run \
 
 > **Tip**: To observe the agent's step-by-step workflow more clearly (e.g., for demos or debugging), set `--parallel_num 1` so that each phase runs sequentially.
 
+**Step 2 (Alternative): Concolic Execution with Frida Traces (Binary-Only Objective)**
+
+1. Build an uninstrumented target binary:
+
+```bash
+mkdir -p ./code_example/bin
+gcc -O0 -g -fno-omit-frame-pointer \
+    -o ./code_example/bin/count_plain \
+    ./code_example/src/count.c -lm
+```
+
+2. Generate Frida artifacts:
+
+```bash
+python3 ACE.py instrument \
+    --out_dir ./out/frida_count_static \
+    --frida_binary ./code_example/bin/count_plain \
+    --frida_only \
+    --frida_mode static_offset \
+    --frida_target_functions main \
+    --frida_module count_plain
+```
+
+3. Run concolic execution with Frida harness [`code_example/harness/count_frida.py`](code_example/harness/count_frida.py):
+
+```bash
+FRIDA_BIN="$HOME/.local/bin/frida" \
+FRIDA_TARGET_BINARY="$PWD/code_example/bin/count_plain" \
+FRIDA_SCRIPT_PATH="$PWD/out/frida_count_static/frida_hooks.js" \
+FRIDA_TRACE_MAP_PATH="$PWD/out/frida_count_static/frida_trace_map.json" \
+FRIDA_TRACE_MODE=raw \
+FRIDA_CAPTURE_TIMEOUT=10 \
+FRIDA_MAX_RETRIES=5 \
+python3 ACE.py run \
+    --project_dir ./code_example/instr/ \
+    --execution ./code_example/harness/count_frida.py \
+    --out ./out_frida_count_static/ \
+    --rounds 2 \
+    --parallel_num 1 \
+    --timeout 120 \
+    --binary_only
+```
+
 *Output*:
 - `./out/ConcoLLMic_*.log` — detailed execution log
 - `./out/queue/id:*.yaml` — generated test cases with metadata
 
-**Expected cost**: ~$0.40 for 2 rounds with Claude-3.7-Sonnet
+**Expected cost**: model-dependent (depends on selected provider/model, rounds, and program complexity)
 
 
 **Step 3: View Statistics (Optional)**
@@ -299,6 +396,23 @@ python3 ACE.py <command> [options]
 | `replay` | Replay generated test cases |
 | `instrument_data` | Analyze instrumentation statistics |
 | `run_data` | Display testing statistics and costs |
+
+### Frida Binary-Only Flags (Most Common)
+
+- `instrument`:
+  - `--frida_binary <path>`: target ELF binary
+  - `--frida_only`: generate Frida artifacts only (no source instrumentation)
+  - `--frida_mode static_offset`: generate deterministic static-offset hooks (**only supported mode**)
+  - `--frida_target_functions <comma-separated-symbols>`: restrict hook generation to selected symbols
+  - `--frida_module <name>`: module name Frida resolves at runtime
+- `run`:
+  - `--binary_only`: use runtime event discovery objective instead of source-line branch objective
+  - `--execution <frida_harness.py>`: use Frida harness (`validate_brackets_frida.py`, `count_frida.py`)
+
+Common Frida env vars used by harnesses:
+- `FRIDA_BIN`, `FRIDA_TARGET_BINARY`, `FRIDA_SCRIPT_PATH`, `FRIDA_TRACE_MAP_PATH`
+- `FRIDA_TRACE_MODE` (`raw` recommended for manual debugging)
+- `FRIDA_CAPTURE_TIMEOUT`, `FRIDA_MAX_RETRIES`
 
 For detailed options, run:
 ```bash

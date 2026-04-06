@@ -1008,6 +1008,24 @@ def detected_crash(stderr: str, returncode: int) -> tuple[bool, str]:
     # check if the program crashed due to an error
     stderr_lower = stderr.lower()
 
+    # Frida lifecycle noise is not a target crash.
+    if (
+        returncode == 0
+        and "process terminated" in stderr_lower
+        and ("[frida-" in stderr_lower or "spawned `" in stderr_lower)
+    ):
+        return False, None
+
+    # Frida CLI occasionally emits a Python traceback on teardown if the spawned
+    # process has already exited (ProcessNotFoundError). This is wrapper noise,
+    # not a target-program crash signal.
+    if (
+        "traceback" in stderr_lower
+        and "frida.processnotfounderror" in stderr_lower
+        and "frida_tools" in stderr_lower
+    ):
+        return False, None
+
     # memory related errors (C/C++/Rust etc.)
     memory_keywords = [
         "sanitizer",
